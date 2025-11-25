@@ -14,68 +14,121 @@ import os
 import json
 import h5py
 
-OUTPUT_FILE = "training_data.h5"
+class convert_muonitron_hdf5(icetray.I3ConditionalModule):
+    """
+    Class to aggregate frames to an array and dump to
+    a hdf5 file incrementally
+    """
+    def __init__(self, context):
+        """
+        Setting up the module and defining inputs
+        """
+        icetray.I3ConditionalModule.__init__(self, context)
+        self.AddParameter("muonitron_output_key", "xx", "Tracks")
+        self.AddParameter("mcprimary_key", "xx", "MCPrimary")
+        self.AddParameter("outfile", "xx", None)
+        self.AddParameter("buffer_size", "xx", 1000000)
+    
+    def Configure(self):
+        """
+        Getting the module parameters
+        """
+        self.muonitron_key = self.GetParameter("muonitron_output_key")
+        self.mcprim_key = self.GetParameter("mcprimary_key")
+        self.outfile = self.GetParameter("outfile")
+        self.buffer_size = self.GetParameter("buffer_size")
+        # builder = ak.ArrayBuilder()
+        self.temp_list = []
+        self.file_handle = h5py.File(self.outfile, "w")
 
-def write_to_hdf5(input_iterator):
-    # 1. Open file
-    with h5py.File(OUTPUT_FILE, "w") as f:
-
-        # 2. Create Resizable Datasets
+        # Create Resizable Datasets
         # We don't know total size yet, so we make them resizable (maxshape=None)
-        dset_cond = f.create_dataset("conditions", shape=(0, 4), maxshape=(None, 4), dtype='f4', chunks=(10000, 4))
-        dset_muons = f.create_dataset("muons", shape=(0, 3), maxshape=(None, 3), dtype='f4', chunks=(100000, 3))
-        dset_counts = f.create_dataset("counts", shape=(0,), maxshape=(None,), dtype='i4', chunks=(10000,))
+        self.dset_prims = self.file_handle.create_dataset("primaries", 
+                                                    shape=(0, 6), 
+                                                    maxshape=(None, 7), dtype='f4', 
+                                                    chunks=(10000, 7))
+        self.dset_muons = self.file_handle.create_dataset("muons", 
+                                                     shape=(0, 5), 
+                                                     maxshape=(None, 6),
+                                                     dtype='f4',
+                                                     chunks=(100000, 6))
+        self.dset_counts = self.file_handle.create_dataset("counts", 
+                                                      shape=(0,), 
+                                                      maxshape=(None,), 
+                                                      dtype='i4', 
+                                                      chunks=(10000,))
+        self.buf_prim = []
+        self.buf_muons = []
+        self.buf_counts = []
 
-        # Buffers
-        buf_cond, buf_muons, buf_counts = [], [], []
-        CHUNK_SIZE = 50000
+    def DAQ(self, frame):
+        tracks = frame[self.muonitron_key]
+        primary = frame[self.mcprim_key]
+        phis = [ random.uniform(0, 2 * math.pi) for _ in range(50000) ]
+        for d, ts in tracks.items():
+            self.buf_prim.append( [
+                    primary.major_id, 
+                    primary.minor_id,
+                    primary.energy, 
+                    primary.dir.zenith, 
+                    primary.mass, 
+                    primary.time,  
+                    d
+            ] )
+            if len(ts) > 0:
+                self.buf_muons.extend( [
+                    [ primary.major_id, 
+                     primary. minor_id, 
+                     t.energy, 
+                     t.radius*math.sin(phis[j]), 
+                     t.radius*math.cos(phis[j]), 
+                     t.time] for j, t in enumerate(ts)
+                ] )
+                self.buf_counts.append(len(ts))
+            else:
+                self.buf_muons.extend( [ [primary.major_id, 
+                                          primary.minor_id, 
+                                          0, 0, 0, 0] ] )
+                self.buf_counts.append(1)
+        if len(self.buf_prim) >= self.buffer_size:
+            self._append_datasets()
+            self.buf_prim = []
+            self.buf_muons = []
+            self.buf_counts = []
 
-        for event in input_iterator:
-            # ... (Logic to extract cond, muons, count from event) ...
-            # Example mock data:
-            cond = [1.0, 0.5, 1.0, 2.5]
-            muons = [[10.0, 5.0, -5.0], [12.0, 4.0, -4.0]]
-            count = 2
+        
+    def Finish(self):
+        self._append_datasets()
+        self.file_handle.close()
+        with h5py.File(self.outfile, "r") as f:
+            print(f.keys())
+            print(f['primaries'].shape)
+            print(f['primaries'][0:100])
+            print(f["muons"][0:100])
+    
+    def _append_datasets(self):
+        # Current size
+        curr_p = self.dset_prims.shape[0]
+        curr_m = self.dset_muons.shape[0]
+        curr_n = self.dset_counts.shape[0]
+        
+        # New size
+        new_p = curr_p + len(self.buf_prim)
+        new_m = curr_m + len(self.buf_muons)
+        new_n = curr_n + len(self.buf_counts)
 
-            buf_cond.append(cond)
-            buf_muons.extend(muons)
-            buf_counts.append(count)
+        # Resize
+        self.dset_prims.resize((new_p, 7))
+        self.dset_muons.resize((new_m, 6))
+        self.dset_counts.resize((new_n,))
 
-            # 3. Flush when buffer is full
-            if len(buf_cond) >= CHUNK_SIZE:
-                _append_to_dsets(dset_cond, dset_muons, dset_counts, buf_cond, buf_muons, buf_counts)
-                buf_cond, buf_muons, buf_counts = [], [], [] # Clear
-
-        # 4. Final Flush
-        if buf_cond:
-            _append_to_dsets(dset_cond, dset_muons, dset_counts, buf_cond, buf_muons, buf_counts)
-
-def _append_to_dsets(ds_c, ds_m, ds_n, b_c, b_m, b_n):
-    # Current size
-    curr_c = ds_c.shape[0]
-    curr_m = ds_m.shape[0]
-    curr_n = ds_n.shape[0]
-
-    # New size
-    new_c = curr_c + len(b_c)
-    new_m = curr_m + len(b_m)
-    new_n = curr_n + len(b_n)
-
-    # Resize
-    ds_c.resize((new_c, 4))
-    ds_m.resize((new_m, 3))
-    ds_n.resize((new_n,))
-
-    # Write
-    ds_c[curr_c:] = b_c
-    ds_m[curr_m:] = b_m
-    ds_n[curr_n:] = b_n
-    print(f"Wrote batch. Total events: {new_n}")
+        self.dset_prims[curr_p:] = self.buf_prim
+        self.dset_muons[curr_m:] = self.buf_muons
+        self.dset_counts[curr_n:] = self.buf_counts
 
 class convert_muonitron_jsonl(icetray.I3ConditionalModule):
     """
-    Class to aggregate frames to a large awkward array and dump to
-    a parquet file in the end
+    Class to dump per frame information into per line of a file. Frame information is summarized in a json object
     """
 
     def __init__(self, context):
@@ -95,14 +148,15 @@ class convert_muonitron_jsonl(icetray.I3ConditionalModule):
         self.mcprim_key = self.GetParameter("mcprimary_key")
         self.outfile = self.GetParameter("outfile")
         # builder = ak.ArrayBuilder()
-        self.temp_list = []
-        self.file_handle = open(self.outfile, "w")
+        self.hdf5_file_handle = h5py.FILE(self.outfile, "w")
         # self.temp_dict = defaultdict(list)
 
     def DAQ(self, frame):
         tracks = frame[self.muonitron_key]
         primary = frame[self.mcprim_key]
-        data = { "primary_energy_zenith": [primary.energy, primary.dir.zenith, self.convert_type(primary)] }
+        data = { "primary_energy_zenith": [primary.energy, 
+                                           primary.dir.zenith, 
+                                           primary.mass] }
         phis = [ random.uniform(0, 2 * math.pi) for _ in range(10000) ]
         depth_tracks_list = []
         for d, ts in tracks.items():
@@ -119,20 +173,20 @@ class convert_muonitron_jsonl(icetray.I3ConditionalModule):
         # np.array(self.temp_list)
         self.file_handle.close()
 
-    def convert_type(self, primary):
-        if primary.type == dataclasses.I3Particle.PPlus:
-            return [1, 0, 0, 0, 0]
-        elif primary.type == dataclasses.I3Particle.He4Nucleus:
-            return [0, 1, 0, 0, 0]
-        elif primary.type == dataclasses.I3Particle.N14Nucleus:
-            return [0, 0, 1, 0, 0]
-        elif primary.type == dataclasses.I3Particle.Al27Nucleus:
-            return [0, 0, 0, 1, 0]
-        elif primary.type == dataclasses.I3Particle.Fe56Nucleus:
-            return [0, 0, 0, 0, 1]
-        else:
-            print(primary.type)
-            raise RuntimeError()
+    # def convert_type(self, primary):
+    #     if primary.type == dataclasses.I3Particle.PPlus:
+    #         return [1, 0, 0, 0, 0]
+    #     elif primary.type == dataclasses.I3Particle.He4Nucleus:
+    #         return [0, 1, 0, 0, 0]
+    #     elif primary.type == dataclasses.I3Particle.N14Nucleus:
+    #         return [0, 0, 1, 0, 0]
+    #     elif primary.type == dataclasses.I3Particle.Al27Nucleus:
+    #         return [0, 0, 0, 1, 0]
+    #     elif primary.type == dataclasses.I3Particle.Fe56Nucleus:
+    #         return [0, 0, 0, 0, 1]
+    #     else:
+    #         print(primary.type)
+    #         raise RuntimeError()
 
 def icetray_script(argsparse):
 
@@ -158,7 +212,10 @@ def icetray_script(argsparse):
                   Crust=crust,
                   MCTreeName="I3MCTree_preMuonProp")
 
-   tray.AddModule(convert_muonitron_jsonl,
+#    tray.AddModule(convert_muonitron_jsonl,
+#                   outfile=argsparse.outfile)
+   
+   tray.AddModule(convert_muonitron_hdf5, 
                   outfile=argsparse.outfile)
 
    # tray.Add("I3Writer","outwriter",
