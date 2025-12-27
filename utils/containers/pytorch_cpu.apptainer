@@ -1,6 +1,9 @@
 Bootstrap: docker
 From: ubuntu:24.04
 
+%files
+    requirements.txt /opt/requirements.txt
+
 %post
     export DEBIAN_FRONTEND=noninteractive
 
@@ -27,15 +30,7 @@ From: ubuntu:24.04
     export VIRTUAL_ENV=/opt/venv
     export PATH="/opt/venv/bin:$PATH"
 
-    pip3 install h5py \
-    torch \
-    torchvision \
-    torchaudio \
-    torchdatasets \
-    torchtext \
-    datasets \
-    transformers \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+    pip3 install -r /opt/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 %environment
     export VIRTUAL_ENV=/opt/venv

@@ -43,6 +43,8 @@ class SingleHDF5Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.counts_ram)
 
+
+# TODO: TEST THIS
 class MultiHDF5Dataset(torch.utils.data.Dataset):
     def __init__(self, file_paths):
         """
@@ -132,6 +134,139 @@ class MultiHDF5Dataset(torch.utils.data.Dataset):
             if f is not None:
                 f.close()
 
+# TODO: Use Pelican FS pulling in data 
+# See https://github.com/PelicanPlatform/pelicanfs?tab=readme-ov-file#authorization for auth
+# See https://github.com/PelicanPlatform/PelicanPytorchTutorial/blob/main/doc/UsingpyTorchwithPelican.md
+
+# Example: PelicanHDF5Dataset
+# This is a stub implementation showing how to integrate Pelican FS with MultiHDF5Dataset
+class PelicanHDF5Dataset(torch.utils.data.Dataset):
+    """
+    Loads HDF5 files from a Pelican federation using pelicanfs.
+    
+    Usage example:
+        # Create dataset from files on OSDF (Open Science Data Federation)
+        pelican_urls = [
+            "pelican://osg-htc.org/chtc/PUBLIC/user/data_0.h5",
+            "pelican://osg-htc.org/chtc/PUBLIC/user/data_1.h5",
+        ]
+        dataset = PelicanHDF5Dataset(pelican_urls, federation_url="pelican://osg-htc.org")
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, collate_fn=ragged_collate_fn)
+    """
+    
+    def __init__(self, pelican_urls, token=None, federation_url="pelican://osg-htc.org", cache_dir=None):
+        """
+        Args:
+            pelican_urls (list): List of Pelican URIs
+                                e.g. ["pelican://osg-htc.org/path/to/data_0.h5", ...]
+            federation_url (str): Discovery URL of the Pelican federation
+            cache_dir (str, optional): Local cache directory. If None, uses temporary cache.
+                                      Cache speeds up repeated access to the same files.
+        """
+        try:
+            from pelicanfs.core import PelicanFileSystem
+        except ImportError:
+            raise ImportError("pelicanfs is required. Install with: pip install pelicanfs")
+        
+        self.pelican_urls = sorted(pelican_urls)
+        self.federation_url = federation_url
+        self.cache_dir = cache_dir
+        
+        # Initialize Pelican filesystem
+        if token is None:
+            self.fs = PelicanFileSystem(federation_url)
+        else:
+            self.fs = PelicanFileSystem(federation_url,
+                                        headers={f"Authorization": f"Bearer {token}"})
+        
+        # If cache_dir is specified, wrap with file-based caching
+        if cache_dir is not None:
+            try:
+                import fsspec
+                self.fs = fsspec.filesystem("filecache", 
+                                           target_protocol='pelican',
+                                           cache_storage=cache_dir)
+            except ImportError:
+                raise ImportError("fsspec is required for caching. Install with: pip install fsspec")
+        
+        # Build global index (similar to MultiHDF5Dataset)
+        self.file_offsets = [0]
+        self.total_events = 0
+        self.file_handles = [None] * len(self.pelican_urls)
+        
+        print("Scanning Pelican HDF5 files...")
+        for url in self.pelican_urls:
+            try:
+                # Open file from Pelican and read metadata
+                with self.fs.open(url, 'rb') as f:
+                    h5_file = h5py.File(f, 'r')
+                    n_events = h5_file["counts"].shape[0]
+                    h5_file.close()
+                
+                self.total_events += n_events
+                self.file_offsets.append(self.total_events)
+            except Exception as e:
+                print(f"Warning: Could not read metadata from {url}: {e}")
+        
+        print(f"Total Events Found: {self.total_events}")
+    
+    def _open_file(self, file_idx):
+        """Opens and caches file handle from Pelican."""
+        if self.file_handles[file_idx] is None:
+            try:
+                # Open remote file via Pelican
+                f_remote = self.fs.open(self.pelican_urls[file_idx], 'rb')
+                self.file_handles[file_idx] = h5py.File(f_remote, 'r', swmr=True)
+                
+                # Pre-load counts and build muon offsets (same as MultiHDF5Dataset)
+                self.file_handles[file_idx].counts_cache = self.file_handles[
+                    file_idx]["counts"][:]
+                
+                local_counts = self.file_handles[file_idx].counts_cache
+                self.file_handles[file_idx].muon_offsets = np.concatenate(([0], 
+                    np.cumsum(local_counts)[:-1]))
+            except Exception as e:
+                print(f"Error opening file {self.pelican_urls[file_idx]}: {e}")
+                raise
+        
+        return self.file_handles[file_idx]
+    
+    def __getitem__(self, global_idx):
+        """Retrieve item by global index, fetching from appropriate Pelican file."""
+        # Find which file this index belongs to
+        file_idx = bisect.bisect_right(self.file_offsets, global_idx) - 1
+        local_idx = global_idx - self.file_offsets[file_idx]
+        
+        # Access the file
+        f = self._open_file(file_idx)
+        
+        # Get condition and muons (same logic as MultiHDF5Dataset)
+        prim = torch.tensor(f["conditions"][local_idx])
+        
+        start = f.muon_offsets[local_idx]
+        count = f.counts_cache[local_idx]
+        end = start + count
+        
+        if count == 0:
+            muons = torch.zeros((0, 3), dtype=torch.float32)
+        else:
+            muons = torch.tensor(f["muons"][start:end])
+        
+        if not torch.equal(torch.unique(prim[0:2]), 
+                           torch.unique(muons[:,0:2])):
+            raise RuntimeError("Major and Minor IDs for primaries and muons don't match")
+        
+        return prim[2:], muons[:,2:]
+    
+    def __len__(self):
+        return self.total_events
+    
+    def __del__(self):
+        """Cleanup file handles on exit"""
+        for f in self.file_handles:
+            if f is not None:
+                f.close()
+
 def ragged_collate_fn(batch):
     """
     Custom collate function to handle variable-length muon bundles.
@@ -167,3 +302,50 @@ def ragged_collate_fn(batch):
     batch_idx = torch.repeat_interleave(torch.arange(batch_size), counts)
     
     return flat_muons, batch_idx, prims, counts
+
+
+import torch
+import zarr
+import numpy as np
+
+class ZarrDataset(torch.utils.data.Dataset):
+    def __init__(self, zarr_path):
+        self.zarr_path = zarr_path
+        # Open in read mode. 
+        # If remote (S3/Pelican), zarr_path can be a URL or fsspec mapper.
+        self.root = zarr.open(zarr_path, mode='r')
+        
+        self.primaries = self.root["primaries"]
+        self.muons = self.root["muons"]
+        self.counts = self.root["counts"]
+        
+        # Zarr arrays support NumPy-like slicing, so we can load into RAM easily
+        self.counts_ram = self.counts[:] 
+        
+        # Pre-calculate offsets (Same as before)
+        self.muon_offsets = np.concatenate(([0], np.cumsum(self.counts_ram)[:-1]))
+
+    def __getitem__(self, idx):
+        # 1. Get Condition
+        prim = torch.tensor(self.primaries[idx])
+        
+        # 2. Find Muons for this event
+        start = self.muon_offsets[idx]
+        end = start + self.counts_ram[idx]
+        
+        # 3. Slice directly
+        # Zarr handles the chunk fetching efficiently here
+        if start == end:
+             muons = torch.zeros((0, 3))
+        else:
+             # Zarr slicing returns a numpy array, which we convert to Tensor
+             muons = torch.tensor(self.muons[start:end])
+
+        if not torch.equal(torch.unique(prim[0:2]), 
+                           torch.unique(muons[:,0:2])):
+            raise RuntimeError("ID mismatch")
+
+        return prim[2:], muons[:,2:]
+
+    def __len__(self):
+        return len(self.counts_ram)

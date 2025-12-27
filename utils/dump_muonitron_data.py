@@ -10,9 +10,15 @@ from collections import defaultdict
 import argparse
 import random
 import math
-import os
 import json
 import h5py
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except Exception:
+    pa = None
+    pq = None
 
 class convert_muonitron_hdf5(icetray.I3ConditionalModule):
     """
@@ -126,6 +132,96 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
         self.dset_muons[curr_m:] = self.buf_muons
         self.dset_counts[curr_n:] = self.buf_counts
 
+
+class convert_muonitron_parquet(icetray.I3ConditionalModule):
+    """Dump Muonitron output to Parquet incrementally using PyArrow.
+
+    Output schema is compatible with `training/hf_dataloader.py`:
+    - primary: list[float32] (len=6) -> [major_id, minor_id, E_GeV, zenith_rad, mass_A, depth]
+    - muons: list[list[float32]] -> each muon row is [major_id, minor_id, E_GeV, x_m, y_m]
+
+    Note: IDs are written as float32 to keep a single homogeneous list type.
+    If you need exact 64-bit integer fidelity for IDs, we'd want to store IDs
+    in separate int64 columns instead of embedding them in these float lists.
+    """
+
+    def __init__(self, context):
+        icetray.I3ConditionalModule.__init__(self, context)
+        self.AddParameter("muonitron_output_key", "xx", "Tracks")
+        self.AddParameter("mcprimary_key", "xx", "MCPrimary")
+        self.AddParameter("outfile", "xx", None)
+        self.AddParameter("buffer_size", "xx", 10000)
+
+    def Configure(self):
+        if pa is None or pq is None:
+            raise ImportError("pyarrow is required for Parquet output. Install with: pip install pyarrow")
+
+        self.muonitron_key = self.GetParameter("muonitron_output_key")
+        self.mcprim_key = self.GetParameter("mcprimary_key")
+        self.outfile = self.GetParameter("outfile")
+        self.buffer_size = int(self.GetParameter("buffer_size"))
+
+        if not self.outfile:
+            raise ValueError("outfile must be provided")
+
+        self.schema = pa.schema([
+            ("primary", pa.list_(pa.float32())),
+            ("muons", pa.list_(pa.list_(pa.float32())))
+        ])
+        self.writer = pq.ParquetWriter(self.outfile, self.schema)
+
+        self.buf_primary = []
+        self.buf_muons = []
+
+    def DAQ(self, frame):
+        tracks = frame[self.muonitron_key]
+        primary = frame[self.mcprim_key]
+
+        major_id = float(primary.major_id)
+        minor_id = float(primary.minor_id)
+
+        for depth, ts in tracks.items():
+            self.buf_primary.append([
+                major_id,
+                minor_id,
+                float(primary.energy),
+                float(primary.dir.zenith),
+                float(primary.mass),
+                float(depth),
+            ])
+
+            mu_rows = []
+            for t in ts:
+                phi = random.uniform(0, 2 * math.pi)
+                mu_rows.append([
+                    major_id,
+                    minor_id,
+                    float(t.energy),
+                    float(t.radius * math.sin(phi)),
+                    float(t.radius * math.cos(phi)),
+                ])
+            self.buf_muons.append(mu_rows)
+
+        if len(self.buf_primary) >= self.buffer_size:
+            self._flush()
+
+    def Finish(self):
+        self._flush()
+        if getattr(self, "writer", None) is not None:
+            self.writer.close()
+
+    def _flush(self):
+        if not self.buf_primary:
+            return
+
+        table = pa.Table.from_pydict(
+            {"primary": self.buf_primary, "muons": self.buf_muons},
+            schema=self.schema,
+        )
+        self.writer.write_table(table)
+        self.buf_primary = []
+        self.buf_muons = []
+
 class convert_muonitron_jsonl(icetray.I3ConditionalModule):
     """
     Class to dump per frame information into per line of a file. Frame information is summarized in a json object
@@ -207,7 +303,7 @@ def icetray_script(argsparse):
 
 
    tray.AddModule('Muonitron', 'propagator',
-                  Depths=list(np.linspace(args.mindepth, args.maxdepth, args.depthsteps)*I3Units.km),
+                  Depths=list(np.linspace(argsparse.mindepth, argsparse.maxdepth, argsparse.depthsteps)*I3Units.km),
                   Propagator=MuonPropagator("ice", ecut=-1, vcut=5e-2, rho=1.005),
                   Crust=crust,
                   MCTreeName="I3MCTree_preMuonProp")
@@ -215,8 +311,14 @@ def icetray_script(argsparse):
 #    tray.AddModule(convert_muonitron_jsonl,
 #                   outfile=argsparse.outfile)
    
-   tray.AddModule(convert_muonitron_hdf5, 
-                  outfile=argsparse.outfile)
+   if argsparse.format == "parquet":
+       tray.AddModule(convert_muonitron_parquet,
+                      outfile=argsparse.outfile,
+                      buffer_size=argsparse.buffer_size)
+   else:
+       tray.AddModule(convert_muonitron_hdf5,
+                      outfile=argsparse.outfile,
+                      buffer_size=argsparse.buffer_size)
 
    # tray.Add("I3Writer","outwriter",
    #          filename=args.outfile)
@@ -227,6 +329,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='dump_muonitron_output')
     parser.add_argument("-i", "--infile", dest="infile", type=str, required=True)
     parser.add_argument("-o", "--outfile", dest="outfile", type=str)
+    parser.add_argument("--format", dest="format", choices=["hdf5", "parquet"], default="hdf5")
+    parser.add_argument("--buffer-size", dest="buffer_size", type=int, default=10000)
     parser.add_argument("--mindepth", dest="mindepth", type=float, default=1.)
     parser.add_argument("--maxdepth", dest="maxdepth", type=float, default=2.8)
     parser.add_argument("--depthsteps", dest="depthsteps", type=int, default=100)

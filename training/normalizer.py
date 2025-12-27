@@ -26,6 +26,9 @@ class DataNormalizer:
         Input: [Batch, 4] -> [E_GeV, Zenith_Rad, Mass_A, Depth_km]
         Output: [Batch, 4] Normalized
         """
+        # Ensure input is on the correct device
+        # primaries = primaries.to(self.device) # If we had self.device
+        
         # 1. Physics Transform
         # Normalize primary energy to log PeV energy
         log_E = torch.log10(primaries[:, 0]/1e6)
@@ -69,8 +72,8 @@ class DataNormalizer:
         # x = features_norm * self.stats['feat_std'].to(device) + self.stats['feat_mean'].to(device)
         
         # 2. Inverse Physics Transform
-        E_GeV = torch.pow(10, x[:, 0])*1e-6
-        X_m = x[:, 1] * 500.
-        Y_m = x[:, 2] * 500.
+        E_GeV = torch.pow(10, features_norm[:, 0])*1e6
+        X_m = features_norm[:, 1] * 500.
+        Y_m = features_norm[:, 2] * 500.
         
         return torch.stack([E_GeV, X_m, Y_m], dim=1)
