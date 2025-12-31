@@ -136,13 +136,18 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
 class convert_muonitron_parquet(icetray.I3ConditionalModule):
     """Dump Muonitron output to Parquet incrementally using PyArrow.
 
-    Output schema is compatible with `training/hf_dataloader.py`:
-    - primary: list[float32] (len=6) -> [major_id, minor_id, E_GeV, zenith_rad, mass_A, depth]
-    - muons: list[list[float32]] -> each muon row is [major_id, minor_id, E_GeV, x_m, y_m]
+    Output schema is compatible with `training/hf_dataloader.py`.
 
-    Note: IDs are written as float32 to keep a single homogeneous list type.
-    If you need exact 64-bit integer fidelity for IDs, we'd want to store IDs
-    in separate int64 columns instead of embedding them in these float lists.
+    IDs are stored exactly as int64 columns:
+    - primary_major_id: int64
+    - primary_minor_id: int64
+
+    Physics features stay in the nested float lists expected by the HF loader:
+    - primary: list[float32] (len=4) -> [E_GeV, zenith_rad, mass_A, depth]
+    - muons: list[list[float32]] -> each muon row is [E_GeV, x_m, y_m]
+
+    The loader can optionally re-attach IDs to the tensors for training-time
+    sanity checks.
     """
 
     def __init__(self, context):
@@ -165,11 +170,15 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
             raise ValueError("outfile must be provided")
 
         self.schema = pa.schema([
+            ("primary_major_id", pa.int64()),
+            ("primary_minor_id", pa.int64()),
             ("primary", pa.list_(pa.float32())),
             ("muons", pa.list_(pa.list_(pa.float32())))
         ])
         self.writer = pq.ParquetWriter(self.outfile, self.schema)
 
+        self.buf_primary_major_id = []
+        self.buf_primary_minor_id = []
         self.buf_primary = []
         self.buf_muons = []
 
@@ -177,13 +186,14 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         tracks = frame[self.muonitron_key]
         primary = frame[self.mcprim_key]
 
-        major_id = float(primary.major_id)
-        minor_id = float(primary.minor_id)
+        major_id = int(primary.major_id)
+        minor_id = int(primary.minor_id)
 
         for depth, ts in tracks.items():
+            self.buf_primary_major_id.append(major_id)
+            self.buf_primary_minor_id.append(minor_id)
+
             self.buf_primary.append([
-                major_id,
-                minor_id,
                 float(primary.energy),
                 float(primary.dir.zenith),
                 float(primary.mass),
@@ -194,8 +204,6 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
             for t in ts:
                 phi = random.uniform(0, 2 * math.pi)
                 mu_rows.append([
-                    major_id,
-                    minor_id,
                     float(t.energy),
                     float(t.radius * math.sin(phi)),
                     float(t.radius * math.cos(phi)),
@@ -215,10 +223,17 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
             return
 
         table = pa.Table.from_pydict(
-            {"primary": self.buf_primary, "muons": self.buf_muons},
+            {
+                "primary_major_id": self.buf_primary_major_id,
+                "primary_minor_id": self.buf_primary_minor_id,
+                "primary": self.buf_primary,
+                "muons": self.buf_muons,
+            },
             schema=self.schema,
         )
         self.writer.write_table(table)
+        self.buf_primary_major_id = []
+        self.buf_primary_minor_id = []
         self.buf_primary = []
         self.buf_muons = []
 

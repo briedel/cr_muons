@@ -106,21 +106,51 @@ def parquet_generator(file_paths, federation_url=None, token=None):
                 for i in range(pf.num_row_groups):
                     table = pf.read_row_group(i)
                     pydict = table.to_pydict()
-                    for p, m in zip(pydict['primary'], pydict['muons']):
-                        yield {
-                            "primary": p,
-                            "muons": m
-                        }
+                    has_id_cols = (
+                        'primary_major_id' in pydict and
+                        'primary_minor_id' in pydict
+                    )
+
+                    if has_id_cols:
+                        for maj, minr, p, m in zip(
+                            pydict['primary_major_id'],
+                            pydict['primary_minor_id'],
+                            pydict['primary'],
+                            pydict['muons'],
+                        ):
+                            maj_f = float(np.int64(maj))
+                            min_f = float(np.int64(minr))
+                            p_out = [maj_f, min_f] + list(p)
+                            m_out = [[maj_f, min_f] + list(row) for row in m]
+                            yield {"primary": p_out, "muons": m_out}
+                    else:
+                        for p, m in zip(pydict['primary'], pydict['muons']):
+                            yield {"primary": p, "muons": m}
         else:
             pf = pq.ParquetFile(path)
             for i in range(pf.num_row_groups):
                 table = pf.read_row_group(i)
                 pydict = table.to_pydict()
-                for p, m in zip(pydict['primary'], pydict['muons']):
-                    yield {
-                        "primary": p,
-                        "muons": m
-                    }
+                has_id_cols = (
+                    'primary_major_id' in pydict and
+                    'primary_minor_id' in pydict
+                )
+
+                if has_id_cols:
+                    for maj, minr, p, m in zip(
+                        pydict['primary_major_id'],
+                        pydict['primary_minor_id'],
+                        pydict['primary'],
+                        pydict['muons'],
+                    ):
+                        maj_f = float(np.int64(maj))
+                        min_f = float(np.int64(minr))
+                        p_out = [maj_f, min_f] + list(p)
+                        m_out = [[maj_f, min_f] + list(row) for row in m]
+                        yield {"primary": p_out, "muons": m_out}
+                else:
+                    for p, m in zip(pydict['primary'], pydict['muons']):
+                        yield {"primary": p, "muons": m}
 
 def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=None, token=None):
     """
