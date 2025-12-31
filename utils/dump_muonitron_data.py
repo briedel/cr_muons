@@ -284,21 +284,6 @@ class convert_muonitron_jsonl(icetray.I3ConditionalModule):
         # np.array(self.temp_list)
         self.file_handle.close()
 
-    # def convert_type(self, primary):
-    #     if primary.type == dataclasses.I3Particle.PPlus:
-    #         return [1, 0, 0, 0, 0]
-    #     elif primary.type == dataclasses.I3Particle.He4Nucleus:
-    #         return [0, 1, 0, 0, 0]
-    #     elif primary.type == dataclasses.I3Particle.N14Nucleus:
-    #         return [0, 0, 1, 0, 0]
-    #     elif primary.type == dataclasses.I3Particle.Al27Nucleus:
-    #         return [0, 0, 0, 1, 0]
-    #     elif primary.type == dataclasses.I3Particle.Fe56Nucleus:
-    #         return [0, 0, 0, 0, 1]
-    #     else:
-    #         print(primary.type)
-    #         raise RuntimeError()
-
 def icetray_script(argsparse):
 
    tray = I3Tray()
@@ -334,9 +319,6 @@ def icetray_script(argsparse):
        tray.AddModule(convert_muonitron_hdf5,
                       outfile=argsparse.outfile,
                       buffer_size=argsparse.buffer_size)
-
-   # tray.Add("I3Writer","outwriter",
-   #          filename=args.outfile)
 
    tray.Execute()
 
