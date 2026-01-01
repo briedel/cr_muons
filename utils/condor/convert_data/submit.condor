@@ -1,0 +1,21 @@
+executable   = /home/briedel/code/cr_muons_git/utils/condor/convert_data/submit.sh
+arguments    = $(file)
+
+
+output       = /scratch/briedel/$(ClusterId).$(ProcId).out
+error        = /scratch/briedel/$(ClusterId).$(ProcId).err
+log          = myexe.log
+
+should_transfer_files = YES
+
+when_to_transfer_output = ON_EXIT_OR_EVICT
+
+request_cpus   = 1
+request_memory = 1024M
+request_disk   = 10240K
+
+max_materialize = 10000
+
+queue file matching files /data/sim/IceCube/2023/generated/CORSIKA-in-ice/22803/0000000-0000999/generated/corsika.022803.*.i3.zst
+# /data/sim/IceCube/2023/generated/CORSIKA-in-ice/22803/*/generated/corsika.022803.*.i3.zst
+
