@@ -10,6 +10,7 @@ from collections import defaultdict
 import argparse
 import random
 import math
+import os
 import json
 import h5py
 
@@ -169,13 +170,31 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         if not self.outfile:
             raise ValueError("outfile must be provided")
 
+        # PyArrow can write to local paths (and some supported filesystem URIs).
+        # If a custom URI scheme is used (e.g. pelican://), ParquetWriter will fail.
+        if "://" in self.outfile and not self.outfile.startswith("file://"):
+            raise ValueError(
+                f"Unsupported outfile URI for pyarrow ParquetWriter: {self.outfile}. "
+                "Use a local path, or write via a custom filesystem handle (e.g. pelicanfs)."
+            )
+
+        if os.path.isdir(self.outfile):
+            raise ValueError(f"outfile must be a file path, got directory: {self.outfile}")
+
+        outdir = os.path.dirname(self.outfile)
+        if outdir and not os.path.exists(outdir):
+            os.makedirs(outdir, exist_ok=True)
+
         self.schema = pa.schema([
-            ("primary_major_id", pa.int64()),
-            ("primary_minor_id", pa.int64()),
+            ("primary_major_id", pa.uint64()),
+            ("primary_minor_id", pa.uint64()),
             ("primary", pa.list_(pa.float32())),
             ("muons", pa.list_(pa.list_(pa.float32())))
         ])
-        self.writer = pq.ParquetWriter(self.outfile, self.schema)
+        try:
+            self.writer = pq.ParquetWriter(self.outfile, self.schema)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open Parquet outfile for writing: {self.outfile}: {e}") from e
 
         self.buf_primary_major_id = []
         self.buf_primary_minor_id = []
@@ -186,8 +205,10 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         tracks = frame[self.muonitron_key]
         primary = frame[self.mcprim_key]
 
-        major_id = int(primary.major_id)
-        minor_id = int(primary.minor_id)
+        # These IDs can exceed signed int64 / platform C long.
+        # Store as uint64 and buffer as numpy scalars to avoid PyArrow overflow.
+        major_id = np.uint64(primary.major_id)
+        minor_id = np.uint64(primary.minor_id)
 
         for depth, ts in tracks.items():
             self.buf_primary_major_id.append(major_id)

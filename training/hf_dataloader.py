@@ -118,11 +118,7 @@ def parquet_generator(file_paths, federation_url=None, token=None):
                             pydict['primary'],
                             pydict['muons'],
                         ):
-                            maj_f = float(np.int64(maj))
-                            min_f = float(np.int64(minr))
-                            p_out = [maj_f, min_f] + list(p)
-                            m_out = [[maj_f, min_f] + list(row) for row in m]
-                            yield {"primary": p_out, "muons": m_out}
+                            yield {"primary": p, "muons": m}
                     else:
                         for p, m in zip(pydict['primary'], pydict['muons']):
                             yield {"primary": p, "muons": m}
@@ -143,11 +139,7 @@ def parquet_generator(file_paths, federation_url=None, token=None):
                         pydict['primary'],
                         pydict['muons'],
                     ):
-                        maj_f = float(np.int64(maj))
-                        min_f = float(np.int64(minr))
-                        p_out = [maj_f, min_f] + list(p)
-                        m_out = [[maj_f, min_f] + list(row) for row in m]
-                        yield {"primary": p_out, "muons": m_out}
+                        yield {"primary": p, "muons": m}
                 else:
                     for p, m in zip(pydict['primary'], pydict['muons']):
                         yield {"primary": p, "muons": m}
@@ -163,12 +155,12 @@ def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=
         federation_url: Optional Pelican federation URL
         token: Optional auth token
     """
-    # Define features to ensure correct types and shapes
-    # primary: [4] (log10(E), cos(theta), log10(A), depth)
-    # muons: [N, 3] (log10(E), X, Y)
+    # Define features to ensure correct types and shapes.
+    # Note: IDs may exist in Parquet as separate columns, but we intentionally
+    # do NOT include them in the streamed dataset or training tensors.
     features = Features({
         "primary": Sequence(Value("float32")),
-        "muons": Sequence(Sequence(Value("float32"))) 
+        "muons": Sequence(Sequence(Value("float32")))
     })
     
     if file_format == 'h5':
