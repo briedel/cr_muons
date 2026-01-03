@@ -97,6 +97,36 @@ def parquet_generator(file_paths, federation_url=None, token=None):
             headers = {f"Authorization": f"Bearer {token}"}
         
         fs = PelicanFileSystem(federation_url, headers=headers)
+
+    def _normalize_muons(m, *, default_dim: int):
+        """Normalize the parquet 'muons' field to a 2D float32 array.
+
+        Parquet stores 'muons' as a nested list. For empty events, PyArrow
+        commonly returns an empty Python list, which becomes a 1D empty tensor
+        when passed to torch.tensor(). We instead return a shaped empty array
+        matching the expected feature width.
+        """
+        if m is None:
+            return np.zeros((0, default_dim), dtype=np.float32)
+
+        # Most common case: list-of-lists
+        if isinstance(m, list):
+            if len(m) == 0:
+                return np.zeros((0, default_dim), dtype=np.float32)
+
+            first = m[0]
+            if isinstance(first, (list, tuple, np.ndarray)):
+                inferred_dim = len(first)
+                arr = np.asarray(m, dtype=np.float32)
+                return arr.reshape((-1, inferred_dim))
+
+        # Fallback: try numpy conversion; ensure 2D
+        arr = np.asarray(m, dtype=np.float32)
+        if arr.ndim == 1 and arr.size == 0:
+            return np.zeros((0, default_dim), dtype=np.float32)
+        if arr.ndim == 1:
+            return arr.reshape((-1, default_dim))
+        return arr
     
     for path in file_paths:
         if fs:
@@ -118,10 +148,10 @@ def parquet_generator(file_paths, federation_url=None, token=None):
                             pydict['primary'],
                             pydict['muons'],
                         ):
-                            yield {"primary": p, "muons": m}
+                            yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
                     else:
                         for p, m in zip(pydict['primary'], pydict['muons']):
-                            yield {"primary": p, "muons": m}
+                            yield {"primary": p, "muons": _normalize_muons(m, default_dim=5)}
         else:
             pf = pq.ParquetFile(path)
             for i in range(pf.num_row_groups):
@@ -139,10 +169,10 @@ def parquet_generator(file_paths, federation_url=None, token=None):
                         pydict['primary'],
                         pydict['muons'],
                     ):
-                        yield {"primary": p, "muons": m}
+                        yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
                 else:
                     for p, m in zip(pydict['primary'], pydict['muons']):
-                        yield {"primary": p, "muons": m}
+                        yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
 
 def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=None, token=None):
     """

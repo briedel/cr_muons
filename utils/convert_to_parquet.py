@@ -83,7 +83,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--batch-size", type=int, default=10000, help="Number of events per batch")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10000,
+        help="Number of events per batch",
+    )
     args = parser.parse_args()
     
     convert_h5_to_parquet(args.input, args.output, args.batch_size)
