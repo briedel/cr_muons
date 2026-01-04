@@ -1,5 +1,5 @@
 from rest_tools.client import SavedDeviceGrantAuth
-from rest_tools.oidc import RegisterOpenIDClient
+from rest_tools.client.openid_client import RegisterOpenIDClient
 from pelicanfs import PelicanFileSystem
 from uuid import uuid4
 import argparse
@@ -21,17 +21,37 @@ def _get_access_token(
     target_path: str,
     auth_cache_file: str,
 ) -> str:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            _get_access_token_async(
+                oidc_url=oidc_url,
+                source_path=source_path,
+                target_path=target_path,
+                auth_cache_file=auth_cache_file,
+            )
+        )
+    raise RuntimeError(
+        "_get_access_token() cannot be called from an event loop; use await _get_access_token_async(...)"
+    )
+
+
+async def _get_access_token_async(
+    *,
+    oidc_url: str,
+    source_path: str,
+    target_path: str,
+    auth_cache_file: str,
+) -> str:
     source_path = _normalize_scope_path(source_path)
     target_path = _normalize_scope_path(target_path)
 
-    reg_client = RegisterOpenIDClient(f"{oidc_url}/client")
-    client_info = reg_client.register(
-        client_name=uuid4().hex,
-        redirect_uris=[],
-    )
+    reg_client = RegisterOpenIDClient(f"{oidc_url}", str(uuid4().hex))
+    client_info = await reg_client.register_client()
 
-    client_id = client_info["client_id"]
-    client_secret = client_info["client_secret"]
+    client_id = client_info[0]
+    client_secret = client_info[1]
 
     auth_client = SavedDeviceGrantAuth(
         address="",
@@ -45,7 +65,8 @@ def _get_access_token(
         ],
     )
 
-    return auth_client.get_access_token()
+    return auth_client._openid_token()
+
 
 async def pelican(
     source_path: str,
@@ -53,7 +74,7 @@ async def pelican(
     data: str,
     auth_cache_file: str = ".pelican_auth_cache",
     oidc_url: str = "https://token-issuer.icecube.aq",
-    federation: str = "osdf",
+    federation: str = "osdf://",
     storage_prefix: str = "/icecube/wipac",
 ) -> str:
     source_path = _normalize_scope_path(source_path)
@@ -61,16 +82,19 @@ async def pelican(
     storage_prefix = storage_prefix.rstrip("/")
     full_path = f"{storage_prefix}{target_path}"
 
-    access_token = _get_access_token(
+    access_token = await _get_access_token_async(
         oidc_url=oidc_url,
         source_path=source_path,
         target_path=target_path,
         auth_cache_file=auth_cache_file,
     )
 
+    print(federation, full_path)
+
     pelfs = PelicanFileSystem(
         federation,
         headers={"Authorization": f"Bearer {access_token}"},
+        direct_reads=True,
     )
 
     with pelfs.open(full_path, "w") as f:
@@ -106,8 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--federation",
-        default="osdf",
-        help="Pelican federation name (default: osdf).",
+        default="osdf://",
+        help="Pelican federation name (default: osdf://).",
     )
     parser.add_argument(
         "--storage-prefix",
@@ -134,11 +158,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.no_write:
-        token = _get_access_token(
-            oidc_url=args.oidc_url,
-            source_path=args.source_path,
-            target_path=args.target_path,
-            auth_cache_file=args.auth_cache_file,
+        token = asyncio.run(
+            _get_access_token_async(
+                oidc_url=args.oidc_url,
+                source_path=args.source_path,
+                target_path=args.target_path,
+                auth_cache_file=args.auth_cache_file,
+            )
         )
         print(token)
         return 0
