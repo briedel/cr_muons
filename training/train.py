@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import tempfile
 import numpy as np
 import torch
 import torch.optim as optim
@@ -13,6 +14,41 @@ from normalizer import DataNormalizer
 from model import ScalableGenerator, ScalableCritic, train_step_scalable
 
 from torch.utils.data import DataLoader
+
+
+def _fs_put_json(fs, remote_path: str, data: dict) -> None:
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+        ) as tmp:
+            tmp_path = tmp.name
+            json.dump(data, tmp)
+        fs.put(tmp_path, remote_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _fs_put_torch_checkpoint(fs, remote_path: str, checkpoint_data: dict) -> None:
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+            tmp_path = tmp.name
+        torch.save(checkpoint_data, tmp_path)
+        fs.put(tmp_path, remote_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _select_torch_device(device_arg: str) -> torch.device:
@@ -225,8 +261,11 @@ def save_progress(checkpoint_path, processed_files, fs=None):
     if checkpoint_path:
         if fs:
             try:
-                with fs.open(checkpoint_path, 'w') as f:
-                    json.dump({'processed_files': list(processed_files)}, f)
+                _fs_put_json(
+                    fs,
+                    checkpoint_path,
+                    {"processed_files": list(processed_files)},
+                )
             except Exception as e:
                 print(f"Warning: Could not save checkpoint to Pelican: {e}")
         else:
@@ -244,8 +283,7 @@ def save_model_checkpoint(path, gen, crit, opt_G, opt_C, epoch=0, fs=None):
     
     if fs:
         try:
-            with fs.open(path, 'wb') as f:
-                torch.save(checkpoint_data, f)
+            _fs_put_torch_checkpoint(fs, path, checkpoint_data)
             print(f"Model checkpoint saved to Pelican: {path}")
         except Exception as e:
             print(f"Warning: Could not save model checkpoint to Pelican: {e}")
