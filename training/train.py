@@ -2,6 +2,11 @@ import argparse
 import json
 import os
 import tempfile
+import fnmatch
+import posixpath
+import subprocess
+import sys
+from urllib.parse import urlparse
 import numpy as np
 import torch
 import torch.optim as optim
@@ -14,6 +19,186 @@ from normalizer import DataNormalizer
 from model import ScalableGenerator, ScalableCritic, train_step_scalable
 
 from torch.utils.data import DataLoader
+
+
+def _has_wildcards(s: str) -> bool:
+    return any(ch in s for ch in ("*", "?", "["))
+
+
+def _infer_pelican_federation_url(pelican_uri: str) -> str | None:
+    """Infer federation discovery URL (e.g. pelican://osg-htc.org) from a pelican URI."""
+    try:
+        u = urlparse(pelican_uri)
+    except Exception:
+        return None
+    if u.scheme != "pelican" or not u.netloc:
+        return None
+    return f"pelican://{u.netloc}"
+
+
+def _pelican_uri_dir_and_pattern(pelican_uri: str) -> tuple[str, str]:
+    """Return (dir_uri, basename_pattern) for a pelican:// URI."""
+    u = urlparse(pelican_uri)
+    # Use posixpath for federation paths.
+    base = posixpath.basename(u.path)
+    dir_path = posixpath.dirname(u.path) or "/"
+    dir_uri = f"pelican://{u.netloc}{dir_path}"
+    return dir_uri, base
+
+
+def expand_pelican_wildcards(
+    infiles: list[str],
+    *,
+    federation_url: str | None,
+    token: str | None,
+) -> tuple[list[str], str | None]:
+    """Expand pelican://... glob patterns into concrete file URIs.
+
+    Returns (expanded_infiles, inferred_federation_url).
+    """
+    expanded: list[str] = []
+    inferred_fed: str | None = federation_url
+
+    # Lazily create FS only if we see a pelican wildcard.
+    fs = None
+
+    for item in infiles:
+        item = str(item)
+        if item.startswith("pelican://") and _has_wildcards(item):
+            if inferred_fed is None:
+                inferred_fed = _infer_pelican_federation_url(item)
+            if inferred_fed is None:
+                raise ValueError(
+                    f"Could not infer --federation-url from pelican URI: {item}"
+                )
+
+            if fs is None:
+                try:
+                    from pelicanfs.core import PelicanFileSystem
+                except ImportError as e:
+                    raise ImportError(
+                        "pelicanfs is required to expand pelican:// wildcards. Install with `pip install pelicanfs`."
+                    ) from e
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                fs = PelicanFileSystem(inferred_fed, headers=headers)
+
+            # Prefer glob() if supported by the filesystem.
+            matches: list[str] = []
+            glob_fn = getattr(fs, "glob", None)
+            if callable(glob_fn):
+                try:
+                    res = glob_fn(item)
+                    if isinstance(res, (list, tuple)):
+                        matches = [str(x) for x in res]
+                except Exception:
+                    matches = []
+
+            # Fallback: ls(dir) + fnmatch on basename.
+            if not matches:
+                dir_uri, basename_pat = _pelican_uri_dir_and_pattern(item)
+                ls_fn = getattr(fs, "ls", None)
+                if not callable(ls_fn):
+                    raise RuntimeError(
+                        "Pelican filesystem does not support glob() or ls(); cannot expand wildcards."
+                    )
+                entries = ls_fn(dir_uri)
+                if entries and isinstance(entries[0], dict):
+                    paths = [str(e.get("name", "")) for e in entries if e.get("name")]
+                else:
+                    paths = [str(e) for e in (entries or [])]
+                matches = [p for p in paths if fnmatch.fnmatch(posixpath.basename(p), basename_pat)]
+
+            matches = sorted(set(matches))
+            if not matches:
+                raise FileNotFoundError(f"Pelican wildcard matched 0 files: {item}")
+            expanded.extend(matches)
+        else:
+            expanded.append(item)
+
+    return expanded, inferred_fed
+
+
+def _is_pelican_path(p: str) -> bool:
+    return str(p).startswith("pelican://")
+
+
+def _infer_scope_path_from_pelican_uri(pelican_uri: str, *, storage_prefix: str = "/icecube/wipac") -> str:
+    """Infer an authorization scope path from a pelican:// URI.
+
+    We use the directory path as a prefix scope.
+    """
+    u = urlparse(pelican_uri)
+    path = u.path or "/"
+
+    # pelican:// URIs in this repo commonly look like:
+    #   pelican://osg-htc.org/icecube/wipac/foo/bar
+    # For token scopes we want permissions for /foo/bar.
+    storage_prefix = (storage_prefix or "").rstrip("/")
+    if storage_prefix and path.startswith(storage_prefix + "/"):
+        path = path[len(storage_prefix) :]
+        if not path:
+            path = "/"
+
+    # If the user explicitly provided a directory (trailing '/'), keep it as a directory
+    # but normalize away the trailing slash in the returned scope.
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+        if not path:
+            path = "/"
+
+    # If the last path component looks like a filename or contains globs, scope to the directory.
+    base = posixpath.basename(path)
+    if _has_wildcards(base) or ("." in base and not base.endswith(".")):
+        path = posixpath.dirname(path) or "/"
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path
+
+
+def _fetch_pelican_token_via_helper(
+    *,
+    scope_path: str,
+    federation_url: str,
+    oidc_url: str,
+    auth_cache_file: str,
+    storage_prefix: str,
+    want_modify: bool = False,
+) -> str:
+    """Fetch an access token using the repo's device-flow logic (imported as a library).
+
+    This avoids subprocess buffering issues and makes failures easier to debug.
+    """
+    import logging
+
+    # Ensure device-flow instructions are visible.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    try:
+        from utils.pelican.token_lib import get_access_token
+    except ImportError as e:
+        # Allow running when CWD is not repo root.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        try:
+            from utils.pelican.token_lib import get_access_token
+        except ImportError as e2:
+            raise ImportError(
+                "Auto-token requires rest-tools and the local token helper library. "
+                "Make sure your environment includes the dependencies from requirements.txt."
+            ) from e2
+
+    # federation_url and storage_prefix are kept for backward compatibility with the CLI,
+    # but token acquisition only needs scope paths and the issuer URL.
+    _ = federation_url
+    _ = storage_prefix
+
+    return get_access_token(
+        oidc_url=oidc_url,
+        source_path=scope_path,
+        target_path=scope_path,
+        auth_cache_file=auth_cache_file,
+        want_modify=want_modify,
+    )
 
 
 def _fs_put_json(fs, remote_path: str, data: dict) -> None:
@@ -230,12 +415,31 @@ def get_filesystem(federation_url, token):
     if federation_url:
         try:
             from pelicanfs.core import PelicanFileSystem
-            headers = {f"Authorization": f"Bearer {token}"} if token else None
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
             return PelicanFileSystem(federation_url, headers=headers)
         except ImportError:
             print("Warning: pelicanfs not found, falling back to local filesystem")
             return None
     return None
+
+
+def _select_checkpoint_fs(path: str | None, *, fs, mode: str) -> object | None:
+    """Select filesystem for checkpoint/model-checkpoint IO.
+
+    mode:
+      - "auto": use fs only for pelican:// paths
+      - "local": always use local filesystem
+      - "pelican": always use provided fs (if any)
+    """
+    if not path:
+        return None
+    mode = (mode or "auto").lower()
+    if mode == "local":
+        return None
+    if mode == "pelican":
+        return fs
+    # auto
+    return fs if _is_pelican_path(str(path)) else None
 
 def load_progress(checkpoint_path, fs=None):
     processed_files = set()
@@ -314,8 +518,81 @@ def load_model_checkpoint(path, gen, crit, opt_G, opt_C, device, fs=None):
     return 0
 
 def main(args):
+    # Normalize inputs
+    raw_infiles = [str(x) for x in args.infiles]
+
+    checkpoint_paths: list[str] = []
+    if getattr(args, "checkpoint", None):
+        checkpoint_paths.append(str(args.checkpoint))
+    if getattr(args, "model_checkpoint", None):
+        checkpoint_paths.append(str(args.model_checkpoint))
+
+    # Infer federation URL from any pelican:// path if not provided.
+    inferred_fed = args.federation_url
+    if inferred_fed is None:
+        for p in (raw_infiles + checkpoint_paths):
+            if _is_pelican_path(p):
+                inferred_fed = _infer_pelican_federation_url(p)
+                break
+    if args.federation_url is None and inferred_fed is not None:
+        args.federation_url = inferred_fed
+
+    # If pelican paths are present but no token flow is enabled, warn early.
+    # Prefer checkpoint paths for scope inference (they may require write access).
+    pelican_paths_all = [p for p in (checkpoint_paths + raw_infiles) if _is_pelican_path(p)]
+    pelican_checkpoint_paths = [p for p in checkpoint_paths if _is_pelican_path(p)]
+    if pelican_paths_all and (args.token is None) and (not args.auto_token):
+        print(
+            "Warning: pelican:// paths detected but no --token provided and --auto-token is not set. "
+            "If the data is not public, rerun with --auto-token (device flow) or provide --token."
+        )
+
+    # Optional: fetch token if pelican inputs are present but token is missing.
+    if args.auto_token and (args.token is None):
+        pelican_paths = pelican_paths_all
+        if pelican_paths:
+            if args.federation_url is None:
+                raise ValueError(
+                    "--auto-token was set but --federation-url could not be inferred. "
+                    "Provide --federation-url explicitly."
+                )
+
+            scope_path = args.pelican_scope_path
+            if not scope_path:
+                scope_path = _infer_scope_path_from_pelican_uri(
+                    pelican_paths[0],
+                    storage_prefix=args.pelican_storage_prefix,
+                )
+
+            print(f"Fetching Pelican token for scope: {scope_path}")
+            args.token = _fetch_pelican_token_via_helper(
+                scope_path=scope_path,
+                federation_url=args.federation_url,
+                oidc_url=args.pelican_oidc_url,
+                auth_cache_file=args.pelican_auth_cache_file,
+                storage_prefix=args.pelican_storage_prefix,
+            )
+
+    # Expand pelican:// wildcards after token is available (if needed)
+    expanded_infiles, inferred_fed2 = expand_pelican_wildcards(
+        raw_infiles,
+        federation_url=args.federation_url,
+        token=args.token,
+    )
+    args.infiles = expanded_infiles
+    if args.federation_url is None and inferred_fed2 is not None:
+        args.federation_url = inferred_fed2
+
     # Initialize Filesystem for (optional) remote reads
     fs = get_filesystem(args.federation_url, args.token)
+
+    # Checkpoint/model-checkpoint IO may be local even when inputs are pelican://
+    checkpoint_fs = _select_checkpoint_fs(args.checkpoint, fs=fs, mode=getattr(args, "checkpoint_io", "auto"))
+    model_checkpoint_fs = _select_checkpoint_fs(
+        args.model_checkpoint,
+        fs=fs,
+        mode=getattr(args, "checkpoint_io", "auto"),
+    )
 
     # Print-only mode: preview file contents and exit
     if args.print_file_contents:
@@ -349,8 +626,16 @@ def main(args):
     # (already initialized above)
 
     # Load Checkpoints
-    processed_files = load_progress(args.checkpoint, fs=fs)
-    start_epoch = load_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, device, fs=fs)
+    processed_files = load_progress(args.checkpoint, fs=checkpoint_fs)
+    start_epoch = load_model_checkpoint(
+        args.model_checkpoint,
+        gen,
+        crit,
+        opt_G,
+        opt_C,
+        device,
+        fs=model_checkpoint_fs,
+    )
     
     # Convert input paths to strings for consistent comparison
     all_files = [str(p) for p in args.infiles]
@@ -369,7 +654,6 @@ def main(args):
         if args.use_hf:
             # Infer format from file extension
             file_format = 'parquet' if file_path.endswith('.parquet') else 'h5'
-            
             dataset = get_hf_dataset([file_path], 
                                      file_format=file_format,
                                      streaming=True,
@@ -423,8 +707,8 @@ def main(args):
 
         # Checkpoint after file is done
         processed_files.add(file_path)
-        save_progress(args.checkpoint, processed_files, fs=fs)
-        save_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, fs=fs)
+        save_progress(args.checkpoint, processed_files, fs=checkpoint_fs)
+        save_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, fs=model_checkpoint_fs)
 
 
 if __name__ == "__main__":
@@ -433,7 +717,7 @@ if __name__ == "__main__":
         "-i",
         "--infiles",
         nargs="+",
-        type=Path,
+        type=str,
         required=True,
     )
     parser.add_argument(
@@ -454,6 +738,44 @@ if __name__ == "__main__":
         help="Auth token for Pelican",
     )
     parser.add_argument(
+        "--auto-token",
+        action="store_true",
+        help=(
+            "If pelican:// inputs are provided and --token is omitted, fetch a token via "
+            "utils/pelican/get_pelican_token.py (device flow)."
+        ),
+    )
+    parser.add_argument(
+        "--pelican-scope-path",
+        type=str,
+        default=None,
+        help=(
+            "Scope path to request token permissions for (passed as both --source-path and --target-path). "
+            "If omitted, inferred from the first pelican:// infile."
+        ),
+    )
+    parser.add_argument(
+        "--pelican-oidc-url",
+        type=str,
+        default="https://token-issuer.icecube.aq",
+        help="OIDC issuer URL for device flow (default: https://token-issuer.icecube.aq).",
+    )
+    parser.add_argument(
+        "--pelican-auth-cache-file",
+        type=str,
+        default=".pelican_auth_cache",
+        help="Auth cache file for device flow (default: .pelican_auth_cache).",
+    )
+    parser.add_argument(
+        "--pelican-storage-prefix",
+        type=str,
+        default="/icecube/wipac",
+        help=(
+            "Prefix present in pelican:// URI paths to strip when inferring the token scope path "
+            "(default: /icecube/wipac)."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default="training_checkpoint.json",
@@ -464,6 +786,17 @@ if __name__ == "__main__":
         type=str,
         default="model_checkpoint.pt",
         help="Path to model checkpoint file",
+    )
+
+    parser.add_argument(
+        "--checkpoint-io",
+        type=str,
+        default="auto",
+        choices=["auto", "local", "pelican"],
+        help=(
+            "Where to read/write --checkpoint and --model-checkpoint. "
+            "auto: use PelicanFS only for pelican:// paths; local: always local disk; pelican: always PelicanFS (if configured)."
+        ),
     )
 
     parser.add_argument(
