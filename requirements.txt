@@ -2,6 +2,7 @@ numpy
 torch
 h5py
 tqdm
+tensorboard
 datasets
 pyarrow
 pelicanfs

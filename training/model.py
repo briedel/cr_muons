@@ -94,25 +94,42 @@ class ScalableGenerator(nn.Module):
             batch_index: Batch assignment for each muon [total_muons]
         """
         batch_size = conditions.size(0)
-        total_muons = sum(N_target_list)
+
+        # Accept either a Python list of ints or a tensor of counts.
+        if isinstance(N_target_list, torch.Tensor):
+            counts_list = [int(x) for x in N_target_list.detach().tolist()]
+        else:
+            counts_list = [int(x) for x in N_target_list]
+
+        if any(n < 0 for n in counts_list):
+            raise ValueError("Muon counts must be non-negative")
+
+        total_muons = int(sum(counts_list))
         
         # Validate inputs
-        assert batch_size == len(N_target_list), "Batch size mismatch with N_target_list"
-        assert all(n > 0 for n in N_target_list), "All muon counts must be positive"
+        assert batch_size == len(counts_list), "Batch size mismatch with N_target_list"
+
+        # If the whole batch has zero muons, return empty tensors.
+        if total_muons == 0:
+            empty_muons = torch.empty((0, self.feature_dim), device=self.device)
+            empty_idx = torch.empty((0,), dtype=torch.long, device=self.device)
+            return empty_muons, empty_idx
         
         # 1. Generate Global Context per Event
         global_noise = torch.randn(batch_size, self.latent_dim_global).to(self.device)
         # Normalize multiplicity using log10 to match other log-transformed features (energy, area)
         # +1 avoids log(0) for edge cases
         # To convert back: round(10^network_output) gives integer multiplicity
-        multiplicity_normalized = torch.log10(torch.tensor(N_target_list, device=self.device).unsqueeze(1).float() + 1)
+        multiplicity_normalized = torch.log10(
+            torch.tensor(counts_list, device=self.device).unsqueeze(1).float() + 1
+        )
         
         global_input = torch.cat([global_noise, conditions, multiplicity_normalized], dim=1)
         event_context = self.global_net(global_input)  # [batch_size, HIDDEN_DIM]
         
         # 2. Expand Event Context to Match Individual Muons
         # Example: If batch has [2, 3] muons, repeat event 0 twice and event 1 three times
-        repeats = torch.tensor(N_target_list, device=self.device)
+        repeats = torch.tensor(counts_list, device=self.device)
         flat_context = torch.repeat_interleave(event_context, repeats, dim=0)  # [total_muons, HIDDEN_DIM]
         
         # 3. Generate Independent Noise for Each Muon
@@ -255,7 +272,19 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
 # Moved to if __name__ == "__main__": block at the end of file to avoid global variables
 
 
-def train_step_scalable(gen, crit, opt_G, opt_C, real_muons_flat, real_batch_idx, real_cond, N_list, lambda_gp=10, device="cpu"):
+def train_step_scalable(
+    gen,
+    crit,
+    opt_G,
+    opt_C,
+    real_muons_flat,
+    real_batch_idx,
+    real_cond,
+    N_list,
+    lambda_gp=10,
+    critic_steps: int = 1,
+    device="cpu",
+):
     """Single training step for Wasserstein GAN with gradient penalty.
     
     Args:
@@ -275,26 +304,35 @@ def train_step_scalable(gen, crit, opt_G, opt_C, real_muons_flat, real_batch_idx
     """
     batch_size = real_cond.size(0)
     
+    critic_steps = int(max(1, critic_steps))
+    loss_critic = None
+
     # ===== Update Critic =====
-    opt_C.zero_grad()
-    
-    # Generate fake samples
-    fake_muons_flat, fake_batch_idx = gen(real_cond, N_list)
-    
-    # Score real and fake samples (detach fakes to prevent generator gradient flow)
-    real_score = crit(real_muons_flat, real_batch_idx, real_cond, batch_size)
-    fake_score = crit(fake_muons_flat.detach(), fake_batch_idx, real_cond, batch_size)
-    
-    # Compute Wasserstein loss and gradient penalty
-    gradient_penalty = compute_gp_flat(
-        crit, real_muons_flat, fake_muons_flat.detach(), 
-        real_batch_idx, real_cond, batch_size, device=device
-    )
-    
-    # Wasserstein distance: minimize (fake - real)
-    loss_critic = fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty
-    loss_critic.backward()
-    opt_C.step()
+    for _ in range(critic_steps):
+        opt_C.zero_grad()
+
+        # Generate fake samples
+        fake_muons_flat, fake_batch_idx = gen(real_cond, N_list)
+
+        # Score real and fake samples (detach fakes to prevent generator gradient flow)
+        real_score = crit(real_muons_flat, real_batch_idx, real_cond, batch_size)
+        fake_score = crit(fake_muons_flat.detach(), fake_batch_idx, real_cond, batch_size)
+
+        # Compute Wasserstein loss and gradient penalty
+        gradient_penalty = compute_gp_flat(
+            crit,
+            real_muons_flat,
+            fake_muons_flat.detach(),
+            real_batch_idx,
+            real_cond,
+            batch_size,
+            device=device,
+        )
+
+        # Wasserstein distance: minimize (fake - real)
+        loss_critic = fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty
+        loss_critic.backward()
+        opt_C.step()
     
     # ===== Update Generator =====
     opt_G.zero_grad()
@@ -306,7 +344,7 @@ def train_step_scalable(gen, crit, opt_G, opt_C, real_muons_flat, real_batch_idx
     loss_generator.backward()
     opt_G.step()
     
-    return loss_critic.item(), loss_generator.item()
+    return float(loss_critic.item()) if loss_critic is not None else 0.0, float(loss_generator.item())
 
 if __name__ == "__main__":
     # Configuration

@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import h5py
+import io
+from collections import OrderedDict
 try:
     import pyarrow.parquet as pq
 except ImportError:
@@ -10,6 +12,70 @@ try:
     from datasets import IterableDataset, Features, Sequence, Value
 except ImportError:
     print("Hugging Face datasets library not found. Install with `pip install datasets`")
+
+try:
+    from torch.utils.data import IterableDataset as TorchIterableDataset
+except Exception:
+    TorchIterableDataset = object
+
+
+class FileBytesLRUCache:
+    """A simple, process-local LRU cache for file bytes.
+
+    Notes:
+    - This only helps when DataLoader uses `num_workers=0` (default here), since
+      it is not shared across worker processes.
+    - Intended primarily for Parquet reads via PyArrow.
+    """
+
+    def __init__(self, *, max_bytes: int) -> None:
+        self.max_bytes = int(max(0, max_bytes))
+        self._cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._size_bytes = 0
+
+    def enabled(self) -> bool:
+        return self.max_bytes > 0
+
+    def get(self, key: str) -> bytes | None:
+        if not self.enabled():
+            return None
+        key = str(key)
+        b = self._cache.get(key)
+        if b is None:
+            return None
+        self._cache.move_to_end(key)
+        return b
+
+    def put(self, key: str, data: bytes) -> None:
+        if not self.enabled():
+            return
+        key = str(key)
+        data = bytes(data)
+        n = len(data)
+        if n <= 0 or n > self.max_bytes:
+            return
+
+        old = self._cache.pop(key, None)
+        if old is not None:
+            self._size_bytes -= len(old)
+
+        self._cache[key] = data
+        self._size_bytes += n
+        self._cache.move_to_end(key)
+
+        # Evict LRU until we're under budget.
+        while self._size_bytes > self.max_bytes and self._cache:
+            _, ev = self._cache.popitem(last=False)
+            self._size_bytes -= len(ev)
+
+    def get_or_load(self, key: str, loader) -> bytes:
+        key = str(key)
+        b = self.get(key)
+        if b is not None:
+            return b
+        b = loader()
+        self.put(key, b)
+        return b
 
 def process_h5_file(f):
     """Helper to yield examples from an open h5py File object"""
@@ -41,7 +107,7 @@ def process_h5_file(f):
             "muons": m
         }
 
-def h5_generator(file_paths, federation_url=None, token=None):
+def h5_generator(file_paths, federation_url=None, token=None, memory_cache=None):
     """
     Generator that yields examples from HDF5 files.
     This allows streaming data into a Hugging Face Dataset.
@@ -75,106 +141,123 @@ def h5_generator(file_paths, federation_url=None, token=None):
             with h5py.File(path, 'r') as f:
                 yield from process_h5_file(f)
 
-def parquet_generator(file_paths, federation_url=None, token=None):
-    """
-    Generator that yields examples from Parquet files.
+def parquet_generator(file_paths, federation_url=None, token=None, memory_cache=None):
+    """Generator that yields examples from Parquet files.
+
+    If `memory_cache` is provided (e.g. FileBytesLRUCache), this will cache whole
+    Parquet file bytes in RAM up to the configured limit and read via BytesIO.
     """
     if pq is None:
         raise ImportError("pyarrow is required to read parquet files. Install with `pip install pyarrow`")
 
-    # Ensure paths are strings
     file_paths = [str(p) for p in file_paths]
-    
+
     fs = None
     if federation_url:
         try:
             from pelicanfs.core import PelicanFileSystem
         except ImportError:
             raise ImportError("pelicanfs is required. Install with: pip install pelicanfs")
-        
-        headers = None
-        if token:
-            headers = {f"Authorization": f"Bearer {token}"}
-        
+
+        headers = {"Authorization": f"Bearer {token}"} if token else None
         fs = PelicanFileSystem(federation_url, headers=headers)
 
-    def _normalize_muons(m, *, default_dim: int):
-        """Normalize the parquet 'muons' field to a 2D float32 array.
-
-        Parquet stores 'muons' as a nested list. For empty events, PyArrow
-        commonly returns an empty Python list, which becomes a 1D empty tensor
-        when passed to torch.tensor(). We instead return a shaped empty array
-        matching the expected feature width.
-        """
+    def _normalize_muons(m, *, default_dim: int = 3):
         if m is None:
             return np.zeros((0, default_dim), dtype=np.float32)
 
-        # Most common case: list-of-lists
         if isinstance(m, list):
             if len(m) == 0:
                 return np.zeros((0, default_dim), dtype=np.float32)
-
             first = m[0]
             if isinstance(first, (list, tuple, np.ndarray)):
                 inferred_dim = len(first)
                 arr = np.asarray(m, dtype=np.float32)
                 return arr.reshape((-1, inferred_dim))
 
-        # Fallback: try numpy conversion; ensure 2D
         arr = np.asarray(m, dtype=np.float32)
         if arr.ndim == 1 and arr.size == 0:
             return np.zeros((0, default_dim), dtype=np.float32)
         if arr.ndim == 1:
             return arr.reshape((-1, default_dim))
         return arr
-    
+
+    def _iter_parquet_file(pf):
+        """Iterate a parquet file via Arrow record batches.
+
+        This avoids `table.to_pydict()` (which materializes full Python lists)
+        and instead walks smaller Arrow record batches.
+        """
+        try:
+            import pyarrow as pa
+        except Exception:
+            pa = None
+
+        # Tuneable chunk size: larger reduces Python overhead, but uses more RAM.
+        record_batch_size = 4096
+
+        # Only read the columns we need.
+        columns = ["primary", "muons"]
+
+        for rb in pf.iter_batches(batch_size=record_batch_size, columns=columns):
+            n = rb.num_rows
+            if n <= 0:
+                continue
+
+            prim_col = rb.column(0)
+            mu_col = rb.column(1)
+
+            # Fast path: fixed-size primary vectors -> numpy 2D (fewer Python objects).
+            prim_np = None
+            prim_list_size = None
+            if pa is not None:
+                try:
+                    if pa.types.is_fixed_size_list(prim_col.type):
+                        prim_list_size = prim_col.type.list_size
+                        # Flatten values then reshape. This may copy depending on Arrow layout,
+                        # but still avoids per-row Python list creation for primaries.
+                        prim_np = prim_col.values.to_numpy(zero_copy_only=False).reshape((n, prim_list_size))
+                except Exception:
+                    prim_np = None
+
+            for i in range(n):
+                if prim_np is not None:
+                    p = prim_np[i]
+                else:
+                    p = prim_col[i].as_py()
+                m = mu_col[i].as_py()
+                yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
+
+    cache_enabled = bool(memory_cache is not None and getattr(memory_cache, "enabled", lambda: False)())
+
     for path in file_paths:
         if fs:
-            # Open remote file via Pelican
-            with fs.open(path, 'rb') as remote_f:
-                pf = pq.ParquetFile(remote_f)
-                for i in range(pf.num_row_groups):
-                    table = pf.read_row_group(i)
-                    pydict = table.to_pydict()
-                    has_id_cols = (
-                        'primary_major_id' in pydict and
-                        'primary_minor_id' in pydict
-                    )
+            if cache_enabled:
+                def _load_bytes() -> bytes:
+                    with fs.open(path, "rb") as remote_f:
+                        return remote_f.read()
 
-                    if has_id_cols:
-                        for maj, minr, p, m in zip(
-                            pydict['primary_major_id'],
-                            pydict['primary_minor_id'],
-                            pydict['primary'],
-                            pydict['muons'],
-                        ):
-                            yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
-                    else:
-                        for p, m in zip(pydict['primary'], pydict['muons']):
-                            yield {"primary": p, "muons": _normalize_muons(m, default_dim=5)}
+                raw = memory_cache.get_or_load(path, _load_bytes)
+                pf = pq.ParquetFile(io.BytesIO(raw))
+                yield from _iter_parquet_file(pf)
+            else:
+                with fs.open(path, "rb") as remote_f:
+                    pf = pq.ParquetFile(remote_f)
+                    yield from _iter_parquet_file(pf)
         else:
-            pf = pq.ParquetFile(path)
-            for i in range(pf.num_row_groups):
-                table = pf.read_row_group(i)
-                pydict = table.to_pydict()
-                has_id_cols = (
-                    'primary_major_id' in pydict and
-                    'primary_minor_id' in pydict
-                )
+            if cache_enabled:
+                def _load_bytes() -> bytes:
+                    with open(path, "rb") as f:
+                        return f.read()
 
-                if has_id_cols:
-                    for maj, minr, p, m in zip(
-                        pydict['primary_major_id'],
-                        pydict['primary_minor_id'],
-                        pydict['primary'],
-                        pydict['muons'],
-                    ):
-                        yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
-                else:
-                    for p, m in zip(pydict['primary'], pydict['muons']):
-                        yield {"primary": p, "muons": _normalize_muons(m, default_dim=3)}
+                raw = memory_cache.get_or_load(path, _load_bytes)
+                pf = pq.ParquetFile(io.BytesIO(raw))
+                yield from _iter_parquet_file(pf)
+            else:
+                pf = pq.ParquetFile(path)
+                yield from _iter_parquet_file(pf)
 
-def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=None, token=None):
+def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=None, token=None, memory_cache=None):
     """
     Creates a Hugging Face Dataset from HDF5 or Parquet files.
     
@@ -184,6 +267,7 @@ def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=
         streaming: If True, returns an IterableDataset (lazy loading)
         federation_url: Optional Pelican federation URL
         token: Optional auth token
+        memory_cache: Optional FileBytesLRUCache for caching whole-file bytes
     """
     # Define features to ensure correct types and shapes.
     # Note: IDs may exist in Parquet as separate columns, but we intentionally
@@ -205,12 +289,175 @@ def get_hf_dataset(file_paths, file_format='h5', streaming=True, federation_url=
         gen_kwargs={
             "file_paths": file_paths,
             "federation_url": federation_url,
-            "token": token
+            "token": token,
+            "memory_cache": memory_cache,
         }, 
         features=features
     )
     
     return ds
+
+
+class ParquetBatchIterableDataset(TorchIterableDataset):
+    """Yield already-batched tensors from Parquet via Arrow record batches.
+
+    Yields tuples matching the training loop signature:
+      (flat_muons, batch_idx, prims, counts)
+
+    This bypasses HuggingFace's per-example generator + Python collation and
+    can significantly reduce the time spent in "load".
+    """
+
+    def __init__(
+        self,
+        file_paths,
+        *,
+        batch_size: int,
+        federation_url: str | None = None,
+        token: str | None = None,
+        memory_cache=None,
+    ) -> None:
+        super().__init__()
+        self.file_paths = [str(p) for p in (file_paths or [])]
+        self.batch_size = int(batch_size)
+        self.federation_url = federation_url
+        self.token = token
+        self.memory_cache = memory_cache
+
+    def __iter__(self):
+        if pq is None:
+            raise ImportError("pyarrow is required to read parquet files. Install with `pip install pyarrow`")
+
+        import pyarrow as pa
+
+        worker_info = None
+        try:
+            from torch.utils.data import get_worker_info
+
+            worker_info = get_worker_info()
+        except Exception:
+            worker_info = None
+
+        fs = None
+        if self.federation_url:
+            try:
+                from pelicanfs.core import PelicanFileSystem
+            except ImportError:
+                raise ImportError("pelicanfs is required. Install with: pip install pelicanfs")
+
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
+            fs = PelicanFileSystem(self.federation_url, headers=headers)
+
+        cache_enabled = bool(self.memory_cache is not None and getattr(self.memory_cache, "enabled", lambda: False)())
+
+        def _as_numpy(a) -> np.ndarray:
+            return a.to_numpy(zero_copy_only=False)
+
+        def _iter_parquet(pf):
+            cols = ["primary", "muons"]
+            rb_idx = 0
+            for rb in pf.iter_batches(batch_size=self.batch_size, columns=cols):
+                if worker_info is not None:
+                    # Shard record-batches across workers so a single file can be decoded
+                    # in parallel without duplicating data.
+                    if (rb_idx % worker_info.num_workers) != worker_info.id:
+                        rb_idx += 1
+                        continue
+                rb_idx += 1
+                n = rb.num_rows
+                if n <= 0:
+                    continue
+
+                prim_col = rb.column(0)
+                mu_col = rb.column(1)
+
+                # Primaries: try a vectorized path when fixed-size list.
+                if pa.types.is_fixed_size_list(prim_col.type):
+                    p_dim = prim_col.type.list_size
+                    prim_np = _as_numpy(prim_col.values).reshape((n, p_dim))
+                    prims = torch.as_tensor(prim_np, dtype=torch.float32)
+                else:
+                    prims = torch.stack(
+                        [torch.as_tensor(prim_col[i].as_py(), dtype=torch.float32) for i in range(n)]
+                    )
+
+                # Muons: list array of muon-vectors; flatten via offsets + values if possible.
+                feat_dim = 3
+                if (pa.types.is_list(mu_col.type) or pa.types.is_large_list(mu_col.type)) and pa.types.is_fixed_size_list(mu_col.type.value_type):
+                    feat_dim = mu_col.type.value_type.list_size
+
+                offsets_arr = getattr(mu_col, "offsets", None) or getattr(mu_col, "value_offsets", None)
+                if offsets_arr is not None:
+                    offsets = _as_numpy(offsets_arr).astype(np.int64)
+                    counts_np = np.diff(offsets)
+                else:
+                    counts_np = np.array([len(mu_col[i].as_py() or []) for i in range(n)], dtype=np.int64)
+                counts = torch.as_tensor(counts_np, dtype=torch.long)
+
+                flat_muons = None
+                if pa.types.is_list(mu_col.type) or pa.types.is_large_list(mu_col.type):
+                    mu_values = mu_col.values
+                    if pa.types.is_fixed_size_list(mu_values.type):
+                        feat_dim = mu_values.type.list_size
+                        vals = _as_numpy(mu_values.values)
+                        flat_muons = torch.as_tensor(vals.reshape((-1, feat_dim)), dtype=torch.float32)
+
+                if flat_muons is None:
+                    # Fallback: per-row conversion.
+                    mu_list = [mu_col[i].as_py() for i in range(n)]
+                    mu_arrs = [
+                        np.asarray(m, dtype=np.float32).reshape((-1, feat_dim)) if (m is not None and len(m) > 0) else np.zeros((0, feat_dim), dtype=np.float32)
+                        for m in mu_list
+                    ]
+                    if any(a.size > 0 for a in mu_arrs):
+                        flat_muons = torch.as_tensor(np.concatenate(mu_arrs, axis=0), dtype=torch.float32)
+                    else:
+                        flat_muons = torch.empty((0, feat_dim), dtype=torch.float32)
+
+                batch_idx = torch.repeat_interleave(torch.arange(n, dtype=torch.long), counts)
+                yield flat_muons, batch_idx, prims, counts
+
+        for path in self.file_paths:
+            if fs:
+                if cache_enabled:
+                    def _load_bytes() -> bytes:
+                        with fs.open(path, "rb") as f:
+                            return f.read()
+                    raw = self.memory_cache.get_or_load(path, _load_bytes)
+                    pf = pq.ParquetFile(io.BytesIO(raw))
+                    yield from _iter_parquet(pf)
+                else:
+                    with fs.open(path, "rb") as f:
+                        pf = pq.ParquetFile(f)
+                        yield from _iter_parquet(pf)
+            else:
+                if cache_enabled:
+                    def _load_bytes() -> bytes:
+                        with open(path, "rb") as f:
+                            return f.read()
+                    raw = self.memory_cache.get_or_load(path, _load_bytes)
+                    pf = pq.ParquetFile(io.BytesIO(raw))
+                    yield from _iter_parquet(pf)
+                else:
+                    pf = pq.ParquetFile(path)
+                    yield from _iter_parquet(pf)
+
+
+def get_parquet_batch_dataset(
+    file_paths,
+    *,
+    batch_size: int,
+    federation_url: str | None = None,
+    token: str | None = None,
+    memory_cache=None,
+) -> ParquetBatchIterableDataset:
+    return ParquetBatchIterableDataset(
+        file_paths,
+        batch_size=batch_size,
+        federation_url=federation_url,
+        token=token,
+        memory_cache=memory_cache,
+    )
 
 def hf_collate_fn(batch):
     """
@@ -227,14 +474,15 @@ def hf_collate_fn(batch):
         counts: [Batch_Size]
     """
     # 1. Stack Primaries
-    prims = torch.stack([torch.tensor(item['primary']) for item in batch])
+    # Use as_tensor to avoid unnecessary copies when inputs are already numpy arrays.
+    prims = torch.stack([torch.as_tensor(item["primary"], dtype=torch.float32) for item in batch])
     
     # 2. Process Muons
-    # Convert lists to tensors
-    muon_list = [torch.tensor(item['muons']) for item in batch]
+    # Convert lists/arrays to tensors (prefer as_tensor to avoid copies)
+    muon_list = [torch.as_tensor(item["muons"], dtype=torch.float32) for item in batch]
     
     # 3. Counts
-    counts = torch.tensor([len(m) for m in muon_list], dtype=torch.long)
+    counts = torch.tensor([int(m.shape[0]) if m.ndim >= 1 else int(m.numel()) for m in muon_list], dtype=torch.long)
     
     # 4. Flatten Muons
     if len(muon_list) > 0:
@@ -243,12 +491,12 @@ def hf_collate_fn(batch):
         if valid_muons:
             flat_muons = torch.cat(valid_muons, dim=0)
         else:
-            flat_muons = torch.empty((0, 3))
+            flat_muons = torch.empty((0, 3), dtype=torch.float32)
     else:
-        flat_muons = torch.empty((0, 3))
+        flat_muons = torch.empty((0, 3), dtype=torch.float32)
         
     # 5. Create Batch Index
     batch_size = len(batch)
-    batch_idx = torch.repeat_interleave(torch.arange(batch_size), counts)
+    batch_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.long), counts)
     
     return flat_muons, batch_idx, prims, counts

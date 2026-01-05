@@ -23,7 +23,12 @@ class DataNormalizer:
 
     def normalize_primaries(self, primaries):
         """
-        Input: [Batch, 4] -> [E_GeV, Zenith_Rad, Mass_A, Depth_km]
+                Normalize event-level primary features.
+
+                Supported input layouts:
+                    - [Batch, 4]: [E_GeV, Zenith_Rad, Mass_A, Depth_m]
+                    - [Batch, 5+]: [E_GeV, Zenith_Rad, Mass_A, (optional time/other), Depth_m, ...]
+
         Output: [Batch, 4] Normalized
         """
         # Ensure input is on the correct device
@@ -36,10 +41,19 @@ class DataNormalizer:
         cos_Z = torch.cos(primaries[:, 1])
         # normalize to log(mass primary)
         log_A = torch.log10(primaries[:, 2])
-        # primaries[:,3] is the relative time of the primary interaction
-        # not used right now
-        # normalize to km slant depth
-        depth = primaries[:, 4] / 1000.
+        # Some datasets include an extra field (e.g. relative interaction time)
+        # before depth; others provide depth as the 4th value.
+        if primaries.ndim != 2:
+            raise ValueError(f"primaries must be rank-2 [batch, features], got shape={tuple(primaries.shape)}")
+        if primaries.shape[1] >= 5:
+            depth_m = primaries[:, 4]
+        elif primaries.shape[1] == 4:
+            depth_m = primaries[:, 3]
+        else:
+            raise ValueError(
+                f"primaries must have at least 4 features [E, zenith, mass, depth], got shape={tuple(primaries.shape)}"
+            )
+        depth = depth_m / 1000.
 
         return torch.stack([log_E, cos_Z, log_A, depth], dim=1)
 
