@@ -338,6 +338,23 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         except Exception:
             worker_info = None
 
+        dist_rank = 0
+        dist_world = 1
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist_rank = int(dist.get_rank())
+                dist_world = int(dist.get_world_size())
+        except Exception:
+            dist_rank = 0
+            dist_world = 1
+
+        worker_id = int(worker_info.id) if worker_info is not None else 0
+        num_workers = int(worker_info.num_workers) if worker_info is not None else 1
+        shard_id = dist_rank * num_workers + worker_id
+        shard_world = dist_world * num_workers
+
         fs = None
         if self.federation_url:
             try:
@@ -357,12 +374,11 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
             cols = ["primary", "muons"]
             rb_idx = 0
             for rb in pf.iter_batches(batch_size=self.batch_size, columns=cols):
-                if worker_info is not None:
-                    # Shard record-batches across workers so a single file can be decoded
-                    # in parallel without duplicating data.
-                    if (rb_idx % worker_info.num_workers) != worker_info.id:
-                        rb_idx += 1
-                        continue
+                # Shard record-batches across DDP ranks and DataLoader workers so a single
+                # file can be decoded in parallel without duplicating data.
+                if shard_world > 1 and (rb_idx % shard_world) != shard_id:
+                    rb_idx += 1
+                    continue
                 rb_idx += 1
                 n = rb.num_rows
                 if n <= 0:

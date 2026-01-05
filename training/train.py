@@ -31,6 +31,53 @@ from model import ScalableGenerator, ScalableCritic, train_step_scalable
 from torch.utils.data import DataLoader
 
 
+class _OutlierParquetWriter:
+    def __init__(self, out_dir: str) -> None:
+        self.out_dir = str(out_dir)
+        os.makedirs(self.out_dir, exist_ok=True)
+        self._counter = 0
+
+    def write_event(
+        self,
+        *,
+        source_file: str,
+        source_file_index: int,
+        batch_index: int,
+        event_index: int,
+        count: int,
+        primaries: object,
+        muons: object,
+    ) -> str:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except Exception as e:
+            raise ImportError(
+                "Writing outliers requires pyarrow. Install with `pip install pyarrow`."
+            ) from e
+
+        def _to_py(x: object):
+            if isinstance(x, torch.Tensor):
+                return x.detach().to("cpu").tolist()
+            return x
+
+        row = {
+            "source_file": str(source_file),
+            "source_file_index": int(source_file_index),
+            "batch_index": int(batch_index),
+            "event_index": int(event_index),
+            "count": int(count),
+            "primaries": _to_py(primaries),
+            "muons": _to_py(muons),
+        }
+
+        table = pa.Table.from_pylist([row])
+        out_path = os.path.join(self.out_dir, f"part-{self._counter:09d}.parquet")
+        pq.write_table(table, out_path)
+        self._counter += 1
+        return out_path
+
+
 def _has_wildcards(s: str) -> bool:
     return any(ch in s for ch in ("*", "?", "["))
 
@@ -578,10 +625,12 @@ def _select_torch_device(device_arg: str) -> torch.device:
         if not torch.cuda.is_available():
             raise RuntimeError("--device rocm was requested, but no ROCm device is available")
         return torch.device("cuda")
+
     if device_arg == "mps":
         if not mps_available:
             raise RuntimeError("--device mps was requested, but MPS is not available")
         return torch.device("mps")
+
     if device_arg == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -592,6 +641,54 @@ def _select_torch_device(device_arg: str) -> torch.device:
     raise ValueError(
         f"Unknown --device value: {device_arg}. Use one of: auto, cpu, cuda, rocm, mps"
     )
+
+
+def _cuda_mem_stats(device: torch.device) -> dict[str, float] | None:
+    """Return CUDA memory stats in MiB for logging.
+
+    Note: PyTorch's allocator caches memory; reserved may stay high even when
+    allocated drops. Rising *allocated* over time is more indicative of a leak.
+    """
+    try:
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        idx = int(device.index) if device.index is not None else int(torch.cuda.current_device())
+        alloc = float(torch.cuda.memory_allocated(idx)) / (1024.0 * 1024.0)
+        reserv = float(torch.cuda.memory_reserved(idx)) / (1024.0 * 1024.0)
+        max_alloc = float(torch.cuda.max_memory_allocated(idx)) / (1024.0 * 1024.0)
+        max_reserv = float(torch.cuda.max_memory_reserved(idx)) / (1024.0 * 1024.0)
+
+        # allocator internals that help distinguish caching/fragmentation vs a true leak
+        active = None
+        inactive_split = None
+        try:
+            stats = torch.cuda.memory_stats(idx)
+            active = float(stats.get("active_bytes.all.current", 0.0)) / (1024.0 * 1024.0)
+            inactive_split = float(stats.get("inactive_split_bytes.all.current", 0.0)) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+
+        free_mib = None
+        total_mib = None
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            free_mib = float(free_b) / (1024.0 * 1024.0)
+            total_mib = float(total_b) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        return {
+            "device_idx": float(idx),
+            "alloc_mib": alloc,
+            "reserved_mib": reserv,
+            "max_alloc_mib": max_alloc,
+            "max_reserved_mib": max_reserv,
+            "active_mib": float(active) if active is not None else float("nan"),
+            "inactive_split_mib": float(inactive_split) if inactive_split is not None else float("nan"),
+            "free_mib": float(free_mib) if free_mib is not None else float("nan"),
+            "total_mib": float(total_mib) if total_mib is not None else float("nan"),
+        }
+    except Exception:
+        return None
 
 
 def _device_backend_label(device: torch.device) -> str:
@@ -1160,6 +1257,15 @@ def main(args):
 
     normalizer = DataNormalizer()
 
+    outlier_writer = None
+    outliers_dir = getattr(args, "outliers_dir", None)
+    if outliers_dir:
+        outlier_writer = _OutlierParquetWriter(str(outliers_dir))
+        ev_thr = int(getattr(args, "max_muons_per_event", 0) or 0)
+        thr_label = "--max-muons-per-event" if ev_thr > 0 else "--max-muons-per-batch"
+        thr_val = ev_thr if ev_thr > 0 else int(getattr(args, "max_muons_per_batch", 0) or 0)
+        print(f"Outlier capture enabled: {outliers_dir} (threshold {thr_label}={thr_val})")
+
     memory_cache = None
     mem_cache_mb = int(getattr(args, "memory_cache_mb", 0) or 0)
     if mem_cache_mb > 0:
@@ -1298,6 +1404,8 @@ def main(args):
         file_t0 = time.perf_counter()
         load_time_s = 0.0
         step_time_s = 0.0
+        skipped_oversize = 0
+        written_oversize = 0
 
         while True:
             t_load0 = time.perf_counter()
@@ -1313,18 +1421,9 @@ def main(args):
 
             events_seen += int(counts.numel())
             muons_seen += int(counts.sum().item())
-            # Handle IDs if present (from HF dataloader/Parquet)
-            # Primaries: [Batch, 6] -> [Batch, 4] (Skip first 2)
-            if prims.shape[1] == 6:
-                prims_feats = prims[:, 2:]
-            else:
-                prims_feats = prims
-                
-            # Muons: [Total, 5] -> [Total, 3] (Skip first 2)
-            if real_muons.shape[1] == 5:
-                real_muons_feats = real_muons[:, 2:]
-            else:
-                real_muons_feats = real_muons
+            # Preserve raw tensors for optional outlier capture.
+            prims_raw = prims
+            real_muons_raw = real_muons
 
             
 
@@ -1343,10 +1442,83 @@ def main(args):
 
             # Move to device. With pinned memory (see --pin-memory) these can be non-blocking.
             non_blocking = bool(getattr(args, "pin_memory", False)) and str(device).startswith("cuda")
-            real_muons_feats = real_muons_feats.to(device, non_blocking=non_blocking)
-            batch_idx = batch_idx.to(device, non_blocking=non_blocking)
-            prims_feats = prims_feats.to(device, non_blocking=non_blocking)
-            counts = counts.to(device, non_blocking=non_blocking)
+
+            # Ragged batches can have huge variation in total muons. A rare outlier batch
+            # can spike peak memory and cause PyTorch to reserve more GPU memory, which then
+            # stays reserved (allocator cache). To prevent long-run OOM from repeated outliers,
+            # optionally split a batch into microbatches bounded by a max total muon count.
+            max_muons = int(getattr(args, "max_muons_per_batch", 0) or 0)
+            max_event_muons = int(getattr(args, "max_muons_per_event", 0) or 0)
+            event_muon_limit = max_event_muons if max_event_muons > 0 else max_muons
+
+            # Per-event outlier handling should apply even when the *batch total* is not large.
+            # If any event has count > event_muon_limit, optionally write it to --outliers-dir
+            # and remove it from this batch so we can keep training on the rest safely.
+            if event_muon_limit > 0:
+                try:
+                    oversize_mask = counts > int(event_muon_limit)
+                    if bool(oversize_mask.any().item()):
+                        oversize_idx = torch.nonzero(oversize_mask, as_tuple=False).flatten().tolist()
+
+                        # Write outliers (raw columns, before ID stripping).
+                        if outlier_writer is not None:
+                            for ev in oversize_idx:
+                                try:
+                                    c = int(counts[ev].item())
+                                    m_evt = (batch_idx == int(ev))
+                                    mu_evt = real_muons_raw[m_evt]
+                                    _ = outlier_writer.write_event(
+                                        source_file=str(file_path),
+                                        source_file_index=int(file_idx),
+                                        batch_index=int(batches_seen),
+                                        event_index=int(ev),
+                                        count=int(c),
+                                        primaries=prims_raw[int(ev)],
+                                        muons=mu_evt,
+                                    )
+                                    written_oversize += 1
+                                except Exception as e:
+                                    tqdm.write(
+                                        f"[file {file_idx}/{len(files_to_process)}] warning: failed to write outlier event (count={c}): {e}"
+                                    )
+
+                        skipped_oversize += len(oversize_idx)
+
+                        # Filter out oversize events from primaries/counts and remap muons/batch_idx.
+                        keep_mask = ~oversize_mask
+                        keep_events = torch.nonzero(keep_mask, as_tuple=False).flatten()
+                        if int(keep_events.numel()) == 0:
+                            skipped_empty += 1
+                            continue
+
+                        # Map old event indices -> new compact indices.
+                        # Example: keep_events=[0,2,5] => mapping {0:0,2:1,5:2}
+                        old_to_new = torch.full((int(counts.numel()),), -1, dtype=torch.long)
+                        old_to_new[keep_events] = torch.arange(int(keep_events.numel()), dtype=torch.long)
+
+                        mu_keep = keep_mask[batch_idx]
+                        real_muons_raw = real_muons_raw[mu_keep]
+                        batch_idx = old_to_new[batch_idx[mu_keep]]
+                        prims_raw = prims_raw[keep_mask]
+                        counts = counts[keep_mask]
+                except Exception:
+                    # If anything goes wrong, fall back to the original batch.
+                    pass
+
+            # Now handle IDs if present (from HF dataloader/Parquet)
+            # Primaries: [Batch, 6] -> [Batch, 4] (Skip first 2)
+            prims = prims_raw
+            real_muons = real_muons_raw
+            if prims.shape[1] == 6:
+                prims_feats = prims[:, 2:]
+            else:
+                prims_feats = prims
+
+            # Muons: [Total, 5] -> [Total, 3] (Skip first 2)
+            if real_muons.shape[1] == 5:
+                real_muons_feats = real_muons[:, 2:]
+            else:
+                real_muons_feats = real_muons
 
             # Some events (or entire batches) can have zero muons. WGAN training
             # requires at least one real sample to compute losses and gradient penalty.
@@ -1354,23 +1526,117 @@ def main(args):
                 skipped_empty += 1
                 continue
 
-            # Normalize
-            real_muons_norm = normalizer.normalize_features(real_muons_feats)
-            prims_norm = normalizer.normalize_primaries(prims_feats)
-            
-            c_loss, g_loss = train_step_scalable(
-                gen, crit, opt_G, opt_C,
-                real_muons_norm, batch_idx, prims_norm, counts,
-                lambda_gp=args.lambda_gp,
-                critic_steps=int(getattr(args, "critic_steps", 1) or 1),
-                device=device
-            )
+            # Keep last-step tensors for optional TensorBoard histogram logging.
+            real_muons_norm = None
+            prims_norm = None
+            counts_dev = None
+
+            def _run_substep(
+                sub_muons_feats: torch.Tensor,
+                sub_batch_idx: torch.Tensor,
+                sub_prims_feats: torch.Tensor,
+                sub_counts: torch.Tensor,
+            ):
+                sub_muons_feats = sub_muons_feats.to(device, non_blocking=non_blocking)
+                sub_batch_idx = sub_batch_idx.to(device, non_blocking=non_blocking)
+                sub_prims_feats = sub_prims_feats.to(device, non_blocking=non_blocking)
+                sub_counts = sub_counts.to(device, non_blocking=non_blocking)
+
+                # Normalize
+                sub_muons_norm = normalizer.normalize_features(sub_muons_feats)
+                sub_prims_norm = normalizer.normalize_primaries(sub_prims_feats)
+
+                c_loss_local, g_loss_local = train_step_scalable(
+                    gen,
+                    crit,
+                    opt_G,
+                    opt_C,
+                    sub_muons_norm,
+                    sub_batch_idx,
+                    sub_prims_norm,
+                    sub_counts,
+                    lambda_gp=args.lambda_gp,
+                    critic_steps=int(getattr(args, "critic_steps", 1) or 1),
+                    device=device,
+                )
+                return c_loss_local, g_loss_local, sub_muons_norm, sub_prims_norm, sub_counts
+
+            # Default: single step on the full batch.
+            if max_muons <= 0 or int(counts.sum().item()) <= max_muons:
+                c_loss, g_loss, real_muons_norm, prims_norm, counts_dev = _run_substep(
+                    real_muons_feats, batch_idx, prims_feats, counts
+                )
+                train_steps_done += 1
+            else:
+                # Microbatch by contiguous event ranges so batch_idx slicing is cheap.
+                bsz = int(counts.numel())
+                start_ev = 0
+                last_c = None
+                last_g = None
+                last_real_norm = None
+                last_prims_norm = None
+                last_counts_dev = None
+                while start_ev < bsz:
+                    # Choose an end_ev so sum(counts[start_ev:end_ev]) <= max_muons, at least 1 event.
+                    cum = 0
+                    end_ev = start_ev
+                    while end_ev < bsz:
+                        c = int(counts[end_ev].item())
+                        # Corner case: a single event can exceed max_muons. In that case,
+                        # microbatching cannot bound memory, so we skip the event to avoid
+                        # catastrophic allocation spikes that can ratchet reserved memory upward.
+                        if event_muon_limit > 0 and end_ev == start_ev and c > event_muon_limit:
+                            # Oversize single-event outliers should have been filtered out earlier.
+                            # Treat any remaining case as empty/skip to be safe.
+                            skipped_oversize += 1
+                            end_ev = start_ev + 1
+                            cum = 0
+                            break
+                        if (end_ev > start_ev) and (cum + c > max_muons):
+                            break
+                        cum += c
+                        end_ev += 1
+                        if cum >= max_muons:
+                            break
+                    if end_ev <= start_ev:
+                        end_ev = start_ev + 1
+
+                    sub_counts = counts[start_ev:end_ev]
+                    if event_muon_limit > 0 and int(sub_counts.max().item()) > event_muon_limit:
+                        # We already counted this as oversize; treat as skipped.
+                        skipped_empty += 1
+                        start_ev = end_ev
+                        continue
+                    # Skip all-zero microbatches (can happen with many 0-muon events).
+                    if int(sub_counts.sum().item()) > 0:
+                        sub_prims = prims_feats[start_ev:end_ev]
+                        m = (batch_idx >= start_ev) & (batch_idx < end_ev)
+                        sub_muons = real_muons_feats[m]
+                        sub_bidx = batch_idx[m] - start_ev
+                        if sub_muons.numel() > 0:
+                            last_c, last_g, last_real_norm, last_prims_norm, last_counts_dev = _run_substep(
+                                sub_muons, sub_bidx, sub_prims, sub_counts
+                            )
+                            train_steps_done += 1
+                        else:
+                            skipped_empty += 1
+                    else:
+                        skipped_empty += 1
+
+                    start_ev = end_ev
+
+                # For logging, use the last microbatch losses.
+                if last_c is None or last_g is None:
+                    skipped_empty += 1
+                    continue
+                c_loss, g_loss = float(last_c), float(last_g)
+                real_muons_norm = last_real_norm
+                prims_norm = last_prims_norm
+                counts_dev = last_counts_dev
 
             t_step1 = time.perf_counter()
             step_time_s += (t_step1 - t_step0)
 
-            train_steps_done += 1
-            
             batch_pbar.set_postfix(c_loss=f"{c_loss:.4f}", g_loss=f"{g_loss:.4f}")
 
             # TensorBoard logging (optional)
@@ -1400,6 +1666,19 @@ def main(args):
                     except Exception:
                         pass
 
+                    mem = _cuda_mem_stats(device)
+                    if mem is not None:
+                        writer.add_scalar("cuda/alloc_mib", float(mem["alloc_mib"]), train_steps_done)
+                        writer.add_scalar("cuda/reserved_mib", float(mem["reserved_mib"]), train_steps_done)
+                        writer.add_scalar("cuda/max_alloc_mib", float(mem["max_alloc_mib"]), train_steps_done)
+                        writer.add_scalar("cuda/max_reserved_mib", float(mem["max_reserved_mib"]), train_steps_done)
+                        try:
+                            writer.add_scalar("cuda/active_mib", float(mem["active_mib"]), train_steps_done)
+                            writer.add_scalar("cuda/inactive_split_mib", float(mem["inactive_split_mib"]), train_steps_done)
+                            writer.add_scalar("cuda/free_mib", float(mem["free_mib"]), train_steps_done)
+                        except Exception:
+                            pass
+
                     # Periodically sync event files if requested.
                     try:
                         _tb_sync(force=False)
@@ -1412,10 +1691,13 @@ def main(args):
 
                     # Counts + primaries
                     try:
-                        writer.add_histogram("data/counts", counts.detach().to("cpu"), train_steps_done)
+                        if counts_dev is not None:
+                            writer.add_histogram("data/counts", counts_dev.detach().to("cpu"), train_steps_done)
                     except Exception:
                         pass
                     try:
+                        if prims_norm is None:
+                            raise RuntimeError("prims_norm unavailable")
                         p_cpu = prims_norm.detach().to("cpu")
                         for d in range(min(int(p_cpu.shape[1]), 16)):
                             writer.add_histogram(f"data/primaries_dim{d}", p_cpu[:, d], train_steps_done)
@@ -1424,6 +1706,8 @@ def main(args):
 
                     # Real vs fake muon feature histograms (normalized space)
                     try:
+                        if real_muons_norm is None:
+                            raise RuntimeError("real_muons_norm unavailable")
                         real_cpu = real_muons_norm.detach()
                         if real_cpu.is_cuda:
                             real_cpu = real_cpu[:max_mu].to("cpu")
@@ -1436,7 +1720,9 @@ def main(args):
 
                     try:
                         with torch.no_grad():
-                            fake_mu, _ = gen(prims_norm, counts)
+                            if prims_norm is None or counts_dev is None:
+                                raise RuntimeError("prims_norm/counts unavailable")
+                            fake_mu, _ = gen(prims_norm, counts_dev)
                         fake_cpu = fake_mu.detach()
                         if fake_cpu.is_cuda:
                             fake_cpu = fake_cpu[:max_mu].to("cpu")
@@ -1457,13 +1743,29 @@ def main(args):
                 mps = muons_seen / elapsed
                 avg_load_ms = (load_time_s / max(1, batches_seen)) * 1e3
                 avg_step_ms = (step_time_s / max(1, batches_seen)) * 1e3
+                mem = _cuda_mem_stats(device)
+                mem_s = ""
+                if mem is not None:
+                    try:
+                        dev_idx = int(mem.get("device_idx"))
+                    except Exception:
+                        dev_idx = -1
+                    free = mem.get("free_mib", float("nan"))
+                    active = mem.get("active_mib", float("nan"))
+                    inact = mem.get("inactive_split_mib", float("nan"))
+                    mem_s = (
+                        f" cuda:{dev_idx} alloc={mem['alloc_mib']:.0f}MiB res={mem['reserved_mib']:.0f}MiB"
+                        f" max_alloc={mem['max_alloc_mib']:.0f}MiB"
+                        f" active={active:.0f}MiB inact_split={inact:.0f}MiB free={free:.0f}MiB"
+                    )
                 tqdm.write(
                     f"[file {file_idx}/{len(files_to_process)}] batches={batches_seen} "
                     f"events={events_seen} muons={muons_seen} "
-                    f"skipped_empty={skipped_empty} "
+                    f"skipped_empty={skipped_empty} skipped_oversize={skipped_oversize} written_oversize={written_oversize} "
                     f"rate: {bps:.2f} batch/s {eps:.1f} evt/s {mps:.1f} mu/s "
                     f"avg: load={avg_load_ms:.1f}ms step={avg_step_ms:.1f}ms "
                     f"c_loss={c_loss:.4f} g_loss={g_loss:.4f}"
+                    f"{mem_s}"
                 )
 
         batch_pbar.close()
@@ -1476,7 +1778,7 @@ def main(args):
         save_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, fs=model_checkpoint_fs)
 
         tqdm.write(
-            f"[file {file_idx}/{len(files_to_process)}] done batches={batches_seen} events={events_seen} muons={muons_seen} skipped_empty={skipped_empty}"
+            f"[file {file_idx}/{len(files_to_process)}] done batches={batches_seen} events={events_seen} muons={muons_seen} skipped_empty={skipped_empty} skipped_oversize={skipped_oversize} written_oversize={written_oversize}"
         )
 
         # Optionally delete cached prefetch-dir copy after this file is fully consumed.
@@ -1503,7 +1805,7 @@ def main(args):
         writer.close()
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-i",
@@ -1560,6 +1862,34 @@ if __name__ == "__main__":
         help="Use pinned host memory for faster host->GPU transfers.",
     )
     parser.add_argument(
+        "--max-muons-per-batch",
+        type=int,
+        default=0,
+        help=(
+            "If >0, split each ragged batch into microbatches so that sum(counts) <= this value. "
+            "Helps prevent GPU OOM when rare batches have extremely many muons (default: 0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--max-muons-per-event",
+        type=int,
+        default=0,
+        help=(
+            "If >0, treat any single event with count > this value as an outlier and skip it (and optionally write it via --outliers-dir). "
+            "If 0, the outlier threshold falls back to --max-muons-per-batch. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--outliers-dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, write any single-event outliers (count > threshold) to this directory as Parquet "
+            "(one small Parquet file per outlier event), and skip them during the main run. "
+            "The threshold is --max-muons-per-event when set (>0), otherwise it falls back to --max-muons-per-batch."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=1024,
@@ -1570,6 +1900,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of critic updates per generator update (WGAN-GP). Default: 1.",
+    )
+    parser.add_argument(
+        "--critic-step",
+        dest="critic_steps",
+        type=int,
+        default=None,
+        help="Alias for --critic-steps (kept for backward compatibility).",
     )
     parser.add_argument(
         "--torch-compile",
@@ -1837,7 +2174,11 @@ if __name__ == "__main__":
         help="Gradient penalty weight",
     )
 
-    args = parser.parse_args()
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    args = parser.parse_args()
     main(args)
 
