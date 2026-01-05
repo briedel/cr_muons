@@ -1429,17 +1429,6 @@ def main(args):
 
             t_step0 = time.perf_counter()
 
-            # Optional: report a small signature so you can confirm data changes across files.
-            if (not reported_first_batch) and bool(getattr(args, "report_first_batch", False)):
-                if real_muons_feats.numel() > 0 and int(counts.sum().item()) > 0:
-                    sig = _first_batch_signature(prims_feats, real_muons_feats, counts)
-                    c_preview = counts[:8].detach().to("cpu").tolist()
-                    tqdm.write(
-                        f"[file {file_idx}/{len(files_to_process)}] first_batch signature={sig} "
-                        f"events={int(counts.numel())} muons={int(counts.sum().item())} counts[:8]={c_preview}"
-                    )
-                    reported_first_batch = True
-
             # Move to device. With pinned memory (see --pin-memory) these can be non-blocking.
             non_blocking = bool(getattr(args, "pin_memory", False)) and str(device).startswith("cuda")
 
@@ -1519,6 +1508,18 @@ def main(args):
                 real_muons_feats = real_muons[:, 2:]
             else:
                 real_muons_feats = real_muons
+
+            # Optional: report a small signature so you can confirm data changes across files.
+            # Must run after *_feats are defined.
+            if (not reported_first_batch) and bool(getattr(args, "report_first_batch", False)):
+                if real_muons_feats.numel() > 0 and int(counts.sum().item()) > 0:
+                    sig = _first_batch_signature(prims_feats, real_muons_feats, counts)
+                    c_preview = counts[:8].detach().to("cpu").tolist()
+                    tqdm.write(
+                        f"[file {file_idx}/{len(files_to_process)}] first_batch signature={sig} "
+                        f"events={int(counts.numel())} muons={int(counts.sum().item())} counts[:8]={c_preview}"
+                    )
+                    reported_first_batch = True
 
             # Some events (or entire batches) can have zero muons. WGAN training
             # requires at least one real sample to compute losses and gradient penalty.
