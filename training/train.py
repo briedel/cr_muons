@@ -1,21 +1,43 @@
 import argparse
 import json
 import os
-import tempfile
-import fnmatch
 import posixpath
 import subprocess
 import sys
 import shutil
-import hashlib
-import threading
 import time
-import queue
 from urllib.parse import urlparse
 import numpy as np
 import torch
 import torch.optim as optim
 from tqdm import tqdm
+
+from utils import (
+    expand_pelican_wildcards,
+    device_backend_label,
+    fetch_pelican_token_via_helper,
+    first_batch_signature,
+    fs_put_file,
+    fs_put_json,
+    get_filesystem,
+    GPUUsageTracker,
+    infer_file_format,
+    infer_pelican_federation_url,
+    infer_scope_path_from_pelican_uri,
+    is_pelican_path,
+    load_model_checkpoint,
+    load_progress,
+    OutlierParquetWriter,
+    PelicanPrefetcher,
+    pelican_uri_to_local_cache_path,
+    PrefetchIterator,
+    prefetch_pelican_files,
+    print_file_contents,
+    save_model_checkpoint,
+    save_progress,
+    select_checkpoint_fs,
+    select_torch_device,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
@@ -29,914 +51,6 @@ from normalizer import DataNormalizer
 from model import ScalableGenerator, ScalableCritic, train_step_scalable
 
 from torch.utils.data import DataLoader
-
-
-class _OutlierParquetWriter:
-    def __init__(self, out_dir: str) -> None:
-        self.out_dir = str(out_dir)
-        os.makedirs(self.out_dir, exist_ok=True)
-        self._counter = 0
-
-    def write_event(
-        self,
-        *,
-        source_file: str,
-        source_file_index: int,
-        batch_index: int,
-        event_index: int,
-        count: int,
-        primaries: object,
-        muons: object,
-    ) -> str:
-        try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-        except Exception as e:
-            raise ImportError(
-                "Writing outliers requires pyarrow. Install with `pip install pyarrow`."
-            ) from e
-
-        def _to_py(x: object):
-            if isinstance(x, torch.Tensor):
-                return x.detach().to("cpu").tolist()
-            return x
-
-        row = {
-            "source_file": str(source_file),
-            "source_file_index": int(source_file_index),
-            "batch_index": int(batch_index),
-            "event_index": int(event_index),
-            "count": int(count),
-            "primaries": _to_py(primaries),
-            "muons": _to_py(muons),
-        }
-
-        table = pa.Table.from_pylist([row])
-        out_path = os.path.join(self.out_dir, f"part-{self._counter:09d}.parquet")
-        pq.write_table(table, out_path)
-        self._counter += 1
-        return out_path
-
-
-def _has_wildcards(s: str) -> bool:
-    return any(ch in s for ch in ("*", "?", "["))
-
-
-def _infer_file_format(file_path: str) -> str:
-    p = str(file_path).lower()
-    if p.endswith(".parquet") or p.endswith(".pq"):
-        return "parquet"
-    if p.endswith(".h5") or p.endswith(".hdf5"):
-        return "h5"
-    # Default to HDF5 for backward compatibility.
-    return "h5"
-
-
-def _infer_pelican_federation_url(pelican_uri: str) -> str | None:
-    """Infer federation discovery URL (e.g. pelican://osg-htc.org) from a pelican URI."""
-    try:
-        u = urlparse(pelican_uri)
-    except Exception:
-        return None
-    if u.scheme != "pelican" or not u.netloc:
-        return None
-    return f"pelican://{u.netloc}"
-
-
-def _pelican_uri_to_local_cache_path(pelican_uri: str, *, cache_dir: str) -> str:
-    """Map a pelican:// URI to a stable local cache path.
-
-    We preserve the full path under the cache directory to avoid collisions.
-    Example:
-      pelican://osg-htc.org/icecube/wipac/a/b/file.parquet
-      -> <cache_dir>/icecube/wipac/a/b/file.parquet
-    """
-    u = urlparse(pelican_uri)
-    rel = (u.path or "/").lstrip("/")
-    return os.path.join(str(cache_dir), rel)
-
-
-def _prefetch_pelican_files(
-    pelican_uris: list[str],
-    *,
-    fs,
-    cache_dir: str,
-) -> list[str]:
-    """Download pelican:// inputs to a local cache directory.
-
-    Returns the list of local file paths (same order as input URIs).
-    """
-    cache_dir = str(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    local_paths: list[str] = []
-    for uri in pelican_uris:
-        uri = str(uri)
-        out_path = _pelican_uri_to_local_cache_path(uri, cache_dir=cache_dir)
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            local_paths.append(out_path)
-            continue
-
-        tmp_path = out_path + ".tmp"
-        print(f"Prefetching {uri} -> {out_path}")
-        with fs.open(uri, "rb") as src, open(tmp_path, "wb") as dst:
-            shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
-        os.replace(tmp_path, out_path)
-        local_paths.append(out_path)
-
-    return local_paths
-
-
-class _PelicanPrefetcher:
-    def __init__(
-        self,
-        pelican_uris: list[str],
-        *,
-        federation_url: str,
-        token: str | None,
-        cache_dir: str,
-        ahead: int,
-    ) -> None:
-        self.pelican_uris = [str(u) for u in pelican_uris]
-        self.uri_to_index = {u: i for i, u in enumerate(self.pelican_uris)}
-        self.federation_url = federation_url
-        self.token = token
-        self.cache_dir = str(cache_dir)
-        self.ahead = max(0, int(ahead))
-
-        self._current_index = -1
-        self._next_download = 0
-        self._stop = False
-        self._status: dict[str, str] = {u: "pending" for u in self.pelican_uris}
-        self._errors: dict[str, str] = {}
-
-        self._cond = threading.Condition()
-        self._thread = threading.Thread(target=self._run, name="pelican-prefetch", daemon=True)
-
-    def start(self) -> None:
-        if self.pelican_uris:
-            self._thread.start()
-
-    def stop(self) -> None:
-        with self._cond:
-            self._stop = True
-            self._cond.notify_all()
-        if self._thread.is_alive():
-            self._thread.join(timeout=5)
-
-    def update_current_uri(self, uri: str) -> None:
-        idx = self.uri_to_index.get(str(uri))
-        if idx is None:
-            return
-        with self._cond:
-            if idx > self._current_index:
-                self._current_index = idx
-                self._cond.notify_all()
-
-    def local_path(self, uri: str) -> str:
-        return _pelican_uri_to_local_cache_path(str(uri), cache_dir=self.cache_dir)
-
-    def wait_for(self, uri: str) -> None:
-        uri = str(uri)
-        if uri not in self._status:
-            return
-        with self._cond:
-            while True:
-                st = self._status.get(uri)
-                if st == "done":
-                    return
-                if st == "error":
-                    raise RuntimeError(f"Prefetch failed for {uri}: {self._errors.get(uri, 'unknown error')}")
-                if self._stop:
-                    raise RuntimeError(f"Prefetch stopped before completing {uri}")
-                self._cond.wait(timeout=0.5)
-
-    def progress_string(self) -> str:
-        """Human-friendly status for tqdm/postfix."""
-        with self._cond:
-            done = sum(1 for s in self._status.values() if s == "done")
-            downloading = sum(1 for s in self._status.values() if s == "downloading")
-            errors = sum(1 for s in self._status.values() if s == "error")
-            total = len(self._status)
-            # pending includes items not yet started.
-            pending = total - done - downloading - errors
-            cur = max(-1, self._current_index)
-            nxt = self._next_download
-        parts = [f"{done}/{total} cached"]
-        if downloading:
-            parts.append(f"{downloading} downloading")
-        if pending:
-            parts.append(f"{pending} pending")
-        if errors:
-            parts.append(f"{errors} errors")
-        # Add a tiny bit of context about the rolling window.
-        parts.append(f"cur={cur} next={nxt}")
-        return ", ".join(parts)
-
-    def _run(self) -> None:
-        try:
-            from pelicanfs.core import PelicanFileSystem
-        except Exception as e:
-            with self._cond:
-                for u in self.pelican_uris:
-                    self._status[u] = "error"
-                    self._errors[u] = f"pelicanfs import failed: {e}"
-                self._cond.notify_all()
-            return
-
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        fs = PelicanFileSystem(self.federation_url, headers=headers)
-
-        while True:
-            with self._cond:
-                if self._stop:
-                    return
-
-                target = min(len(self.pelican_uris), self._current_index + self.ahead + 1)
-                if self._next_download >= target:
-                    self._cond.wait(timeout=0.5)
-                    continue
-
-                uri = self.pelican_uris[self._next_download]
-                self._next_download += 1
-
-                # Mark as downloading.
-                self._status[uri] = "downloading"
-                self._cond.notify_all()
-
-            out_path = self.local_path(uri)
-            out_dir = os.path.dirname(out_path)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-
-            try:
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    with self._cond:
-                        self._status[uri] = "done"
-                        self._cond.notify_all()
-                    continue
-
-                tmp_path = out_path + ".tmp"
-                with fs.open(uri, "rb") as src, open(tmp_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
-                os.replace(tmp_path, out_path)
-                with self._cond:
-                    self._status[uri] = "done"
-                    self._cond.notify_all()
-            except Exception as e:
-                with self._cond:
-                    self._status[uri] = "error"
-                    self._errors[uri] = repr(e)
-                    self._cond.notify_all()
-
-
-def _pelican_uri_dir_and_pattern(pelican_uri: str) -> tuple[str, str]:
-    """Return (dir_uri, basename_pattern) for a pelican:// URI."""
-    u = urlparse(pelican_uri)
-    # Use posixpath for federation paths.
-    base = posixpath.basename(u.path)
-    dir_path = posixpath.dirname(u.path) or "/"
-    dir_uri = f"pelican://{u.netloc}{dir_path}"
-    return dir_uri, base
-
-
-def expand_pelican_wildcards(
-    infiles: list[str],
-    *,
-    federation_url: str | None,
-    token: str | None,
-) -> tuple[list[str], str | None]:
-    """Expand pelican://... glob patterns into concrete file URIs.
-
-    Returns (expanded_infiles, inferred_federation_url).
-    """
-    expanded: list[str] = []
-    inferred_fed: str | None = federation_url
-
-    # Lazily create FS only if we see a pelican wildcard.
-    fs = None
-
-    for item in infiles:
-        item = str(item)
-        if item.startswith("pelican://") and _has_wildcards(item):
-            if inferred_fed is None:
-                inferred_fed = _infer_pelican_federation_url(item)
-            if inferred_fed is None:
-                raise ValueError(
-                    f"Could not infer --federation-url from pelican URI: {item}"
-                )
-
-            if fs is None:
-                try:
-                    from pelicanfs.core import PelicanFileSystem
-                except ImportError as e:
-                    raise ImportError(
-                        "pelicanfs is required to expand pelican:// wildcards. Install with `pip install pelicanfs`."
-                    ) from e
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
-                fs = PelicanFileSystem(inferred_fed, headers=headers)
-
-            # Prefer glob() if supported by the filesystem.
-            matches: list[str] = []
-            glob_fn = getattr(fs, "glob", None)
-            if callable(glob_fn):
-                try:
-                    res = glob_fn(item)
-                    if isinstance(res, (list, tuple)):
-                        matches = [str(x) for x in res]
-                except Exception:
-                    matches = []
-
-            # Fallback: ls(dir) + fnmatch on basename.
-            if not matches:
-                dir_uri, basename_pat = _pelican_uri_dir_and_pattern(item)
-                ls_fn = getattr(fs, "ls", None)
-                if not callable(ls_fn):
-                    raise RuntimeError(
-                        "Pelican filesystem does not support glob() or ls(); cannot expand wildcards."
-                    )
-                entries = ls_fn(dir_uri)
-                if entries and isinstance(entries[0], dict):
-                    paths = [str(e.get("name", "")) for e in entries if e.get("name")]
-                else:
-                    paths = [str(e) for e in (entries or [])]
-                matches = [p for p in paths if fnmatch.fnmatch(posixpath.basename(p), basename_pat)]
-
-            # Normalize matches to full pelican:// URIs. Some filesystem backends
-            # return plain paths like "/icecube/..." or "icecube/...".
-            u = urlparse(item)
-            normalized: list[str] = []
-            for m in matches:
-                m = str(m)
-                if m.startswith("pelican://"):
-                    normalized.append(m)
-                    continue
-                if not m.startswith("/"):
-                    m = "/" + m
-                normalized.append(f"pelican://{u.netloc}{m}")
-            matches = normalized
-
-            matches = sorted(set(matches))
-            if not matches:
-                raise FileNotFoundError(f"Pelican wildcard matched 0 files: {item}")
-            expanded.extend(matches)
-        else:
-            expanded.append(item)
-
-    return expanded, inferred_fed
-
-
-def _is_pelican_path(p: str) -> bool:
-    return str(p).startswith("pelican://")
-
-
-def _infer_scope_path_from_pelican_uri(pelican_uri: str, *, storage_prefix: str = "/icecube/wipac") -> str:
-    """Infer an authorization scope path from a pelican:// URI.
-
-    We use the directory path as a prefix scope.
-    """
-    u = urlparse(pelican_uri)
-    path = u.path or "/"
-
-    # pelican:// URIs in this repo commonly look like:
-    #   pelican://osg-htc.org/icecube/wipac/foo/bar
-    # For token scopes we want permissions for /foo/bar.
-    storage_prefix = (storage_prefix or "").rstrip("/")
-    if storage_prefix and path.startswith(storage_prefix + "/"):
-        path = path[len(storage_prefix) :]
-        if not path:
-            path = "/"
-
-    # If the user explicitly provided a directory (trailing '/'), keep it as a directory
-    # but normalize away the trailing slash in the returned scope.
-    if path != "/" and path.endswith("/"):
-        path = path.rstrip("/")
-        if not path:
-            path = "/"
-
-    # If the last path component looks like a filename or contains globs, scope to the directory.
-    base = posixpath.basename(path)
-    if _has_wildcards(base) or ("." in base and not base.endswith(".")):
-        path = posixpath.dirname(path) or "/"
-
-    if not path.startswith("/"):
-        path = f"/{path}"
-    return path
-
-
-def _first_batch_signature(
-    prims_feats: torch.Tensor,
-    real_muons_feats: torch.Tensor,
-    counts: torch.Tensor,
-    *,
-    n_prims: int = 4,
-    n_muons: int = 8,
-    n_counts: int = 8,
-) -> str:
-    """Return a stable, lightweight signature for debugging progress.
-
-    This is meant to answer: "am I actually seeing new data?" without dumping
-    full batches. It hashes small slices of primaries/muons/counts.
-    """
-
-    def _as_bytes(x: torch.Tensor, max_rows: int) -> bytes:
-        if not isinstance(x, torch.Tensor):
-            return b""
-        if x.numel() == 0:
-            return b""
-        # Keep it lightweight and deterministic.
-        if x.dim() >= 2:
-            x = x[: max_rows]
-        else:
-            x = x[: max_rows]
-        x = x.detach().to("cpu")
-        try:
-            arr = x.contiguous().numpy()
-        except Exception:
-            # Fallback if numpy conversion fails for any reason.
-            arr = x.contiguous().flatten().tolist()
-            return repr(arr).encode("utf-8")
-        return arr.tobytes()
-
-    h = hashlib.sha1()
-    h.update(_as_bytes(prims_feats, int(n_prims)))
-    h.update(_as_bytes(real_muons_feats, int(n_muons)))
-    h.update(_as_bytes(counts, int(n_counts)))
-
-    # Include shapes so two different batches with same first values are less likely.
-    h.update(repr(tuple(prims_feats.shape)).encode("utf-8"))
-    h.update(repr(tuple(real_muons_feats.shape)).encode("utf-8"))
-    h.update(repr(tuple(counts.shape)).encode("utf-8"))
-
-    return h.hexdigest()[:12]
-
-
-class _PrefetchIterator:
-    def __init__(self, base_iter, *, max_prefetch: int) -> None:
-        self._base_iter = base_iter
-        self._max_prefetch = max(0, int(max_prefetch))
-        self._q: "queue.Queue[object]" = queue.Queue(maxsize=self._max_prefetch or 1)
-        self._sentinel = object()
-        self._exc: Exception | None = None
-        self._thread = None
-
-        if self._max_prefetch > 0:
-            self._thread = threading.Thread(target=self._run, name="batch-prefetch", daemon=True)
-            self._thread.start()
-
-    def _run(self) -> None:
-        try:
-            for item in self._base_iter:
-                self._q.put(item)
-            self._q.put(self._sentinel)
-        except Exception as e:
-            self._exc = e
-            self._q.put(self._sentinel)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._max_prefetch <= 0:
-            return next(self._base_iter)
-
-        item = self._q.get()
-        if item is self._sentinel:
-            if self._exc is not None:
-                raise self._exc
-            raise StopIteration
-        return item
-
-
-def _fetch_pelican_token_via_helper(
-    *,
-    scope_path: str,
-    federation_url: str,
-    oidc_url: str,
-    auth_cache_file: str,
-    storage_prefix: str,
-    want_modify: bool = False,
-) -> str:
-    """Fetch an access token using the repo's device-flow logic (imported as a library).
-
-    This avoids subprocess buffering issues and makes failures easier to debug.
-    """
-    import logging
-
-    # Ensure device-flow instructions are visible.
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    try:
-        from utils.pelican.token_lib import get_access_token
-    except ImportError as e:
-        # Allow running when CWD is not repo root.
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        try:
-            from utils.pelican.token_lib import get_access_token
-        except ImportError as e2:
-            raise ImportError(
-                "Auto-token requires rest-tools and the local token helper library. "
-                "Make sure your environment includes the dependencies from requirements.txt."
-            ) from e2
-
-    # federation_url and storage_prefix are kept for backward compatibility with the CLI,
-    # but token acquisition only needs scope paths and the issuer URL.
-    _ = federation_url
-    _ = storage_prefix
-
-    return get_access_token(
-        oidc_url=oidc_url,
-        source_path=scope_path,
-        target_path=scope_path,
-        auth_cache_file=auth_cache_file,
-        want_modify=want_modify,
-    )
-
-
-def _fs_put_json(fs, remote_path: str, data: dict) -> None:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".json",
-            delete=False,
-        ) as tmp:
-            tmp_path = tmp.name
-            json.dump(data, tmp)
-        fs.put(tmp_path, remote_path)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def _fs_put_torch_checkpoint(fs, remote_path: str, checkpoint_data: dict) -> None:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
-            tmp_path = tmp.name
-        torch.save(checkpoint_data, tmp_path)
-        fs.put(tmp_path, remote_path)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def _fs_put_file(fs, remote_path: str, local_path: str) -> None:
-    """Upload a local file to a remote path via fs.put."""
-    fs.put(str(local_path), str(remote_path))
-
-
-def _select_torch_device(device_arg: str) -> torch.device:
-    """Select torch device from CLI arg.
-
-    device_arg:
-      - "auto": prefer CUDA, then MPS, else CPU
-      - "cuda": require CUDA
-      - "mps": require Apple Metal (PyTorch MPS)
-      - "cpu": force CPU
-    """
-    device_arg = (device_arg or "auto").lower()
-
-    has_mps_backend = bool(getattr(torch.backends, "mps", None))
-    mps_available = bool(torch.backends.mps.is_available()) if has_mps_backend else False
-    rocm_build = bool(getattr(torch.version, "hip", None))
-
-    if device_arg == "cpu":
-        return torch.device("cpu")
-    if device_arg == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("--device cuda was requested, but CUDA is not available")
-        return torch.device("cuda")
-    if device_arg == "rocm":
-        # PyTorch uses the 'cuda' device type for ROCm as well.
-        if not rocm_build:
-            raise RuntimeError("--device rocm was requested, but this PyTorch build is not ROCm-enabled")
-        if not torch.cuda.is_available():
-            raise RuntimeError("--device rocm was requested, but no ROCm device is available")
-        return torch.device("cuda")
-
-    if device_arg == "mps":
-        if not mps_available:
-            raise RuntimeError("--device mps was requested, but MPS is not available")
-        return torch.device("mps")
-
-    if device_arg == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if mps_available:
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    raise ValueError(
-        f"Unknown --device value: {device_arg}. Use one of: auto, cpu, cuda, rocm, mps"
-    )
-
-
-def _cuda_mem_stats(device: torch.device) -> dict[str, float] | None:
-    """Return CUDA memory stats in MiB for logging.
-
-    Note: PyTorch's allocator caches memory; reserved may stay high even when
-    allocated drops. Rising *allocated* over time is more indicative of a leak.
-    """
-    try:
-        if device.type != "cuda" or not torch.cuda.is_available():
-            return None
-        idx = int(device.index) if device.index is not None else int(torch.cuda.current_device())
-        alloc = float(torch.cuda.memory_allocated(idx)) / (1024.0 * 1024.0)
-        reserv = float(torch.cuda.memory_reserved(idx)) / (1024.0 * 1024.0)
-        max_alloc = float(torch.cuda.max_memory_allocated(idx)) / (1024.0 * 1024.0)
-        max_reserv = float(torch.cuda.max_memory_reserved(idx)) / (1024.0 * 1024.0)
-
-        # allocator internals that help distinguish caching/fragmentation vs a true leak
-        active = None
-        inactive_split = None
-        try:
-            stats = torch.cuda.memory_stats(idx)
-            active = float(stats.get("active_bytes.all.current", 0.0)) / (1024.0 * 1024.0)
-            inactive_split = float(stats.get("inactive_split_bytes.all.current", 0.0)) / (1024.0 * 1024.0)
-        except Exception:
-            pass
-
-        free_mib = None
-        total_mib = None
-        try:
-            free_b, total_b = torch.cuda.mem_get_info(idx)
-            free_mib = float(free_b) / (1024.0 * 1024.0)
-            total_mib = float(total_b) / (1024.0 * 1024.0)
-        except Exception:
-            pass
-        return {
-            "device_idx": float(idx),
-            "alloc_mib": alloc,
-            "reserved_mib": reserv,
-            "max_alloc_mib": max_alloc,
-            "max_reserved_mib": max_reserv,
-            "active_mib": float(active) if active is not None else float("nan"),
-            "inactive_split_mib": float(inactive_split) if inactive_split is not None else float("nan"),
-            "free_mib": float(free_mib) if free_mib is not None else float("nan"),
-            "total_mib": float(total_mib) if total_mib is not None else float("nan"),
-        }
-    except Exception:
-        return None
-
-
-def _device_backend_label(device: torch.device) -> str:
-    if device.type == "cuda":
-        # CUDA device type may mean NVIDIA CUDA or AMD ROCm.
-        if bool(getattr(torch.version, "hip", None)):
-            return "rocm"
-        return "cuda"
-    return device.type
-
-
-def _print_file_contents(file_path: str, fs=None, max_events: int = 5):
-    """Print a compact preview of an input file.
-
-    This is intended for debugging data/format issues during the file-iteration
-    loop. It does not require the training model to be initialized.
-    """
-    max_events = int(max_events)
-    if max_events <= 0:
-        raise ValueError("max_events must be > 0")
-
-    if file_path.endswith(".parquet"):
-        try:
-            import pyarrow.parquet as pq
-        except Exception as e:
-            raise ImportError(
-                "pyarrow is required to print parquet contents. Install with `pip install pyarrow`."
-            ) from e
-
-        if fs:
-            with fs.open(file_path, 'rb') as f:
-                pf = pq.ParquetFile(f)
-                print(f"\n=== {file_path} (parquet) ===")
-                print(f"row_groups={pf.num_row_groups} schema={pf.schema_arrow}")
-                shown = 0
-                for rg in range(pf.num_row_groups):
-                    if shown >= max_events:
-                        break
-                    table = pf.read_row_group(rg)
-                    pydict = table.to_pydict()
-                    n = len(next(iter(pydict.values()))) if pydict else 0
-                    for i in range(n):
-                        if shown >= max_events:
-                            break
-                        primary = pydict.get('primary', [None])[i]
-                        muons = pydict.get('muons', [None])[i]
-                        maj = pydict.get('primary_major_id', [None])[i] if 'primary_major_id' in pydict else None
-                        minr = pydict.get('primary_minor_id', [None])[i] if 'primary_minor_id' in pydict else None
-                        mu_len = len(muons) if isinstance(muons, list) else (0 if muons is None else None)
-                        first_mu = None
-                        if isinstance(muons, list) and len(muons) > 0:
-                            first_mu = muons[0]
-                        if maj is not None and minr is not None:
-                            print(f"event[{shown}] primary_ids=({maj},{minr}) primary={primary} n_muons={mu_len} first_muon={first_mu}")
-                        else:
-                            print(f"event[{shown}] primary={primary} n_muons={mu_len} first_muon={first_mu}")
-                        shown += 1
-        else:
-            pf = pq.ParquetFile(file_path)
-            print(f"\n=== {file_path} (parquet) ===")
-            print(f"row_groups={pf.num_row_groups} schema={pf.schema_arrow}")
-            shown = 0
-            for rg in range(pf.num_row_groups):
-                if shown >= max_events:
-                    break
-                table = pf.read_row_group(rg)
-                pydict = table.to_pydict()
-                n = len(next(iter(pydict.values()))) if pydict else 0
-                for i in range(n):
-                    if shown >= max_events:
-                        break
-                    primary = pydict.get('primary', [None])[i]
-                    muons = pydict.get('muons', [None])[i]
-                    maj = pydict.get('primary_major_id', [None])[i] if 'primary_major_id' in pydict else None
-                    minr = pydict.get('primary_minor_id', [None])[i] if 'primary_minor_id' in pydict else None
-                    mu_len = len(muons) if isinstance(muons, list) else (0 if muons is None else None)
-                    first_mu = None
-                    if isinstance(muons, list) and len(muons) > 0:
-                        first_mu = muons[0]
-                    if maj is not None and minr is not None:
-                        print(f"event[{shown}] primary_ids=({maj},{minr}) primary={primary} n_muons={mu_len} first_muon={first_mu}")
-                    else:
-                        print(f"event[{shown}] primary={primary} n_muons={mu_len} first_muon={first_mu}")
-                    shown += 1
-        return
-
-    # Default: HDF5
-    try:
-        import h5py
-    except Exception as e:
-        raise ImportError(
-            "h5py is required to print HDF5 contents. Install with `pip install h5py`."
-        ) from e
-
-    def _preview_h5(f):
-        print(f"\n=== {file_path} (h5) ===")
-        keys = list(f.keys())
-        print(f"keys={keys}")
-        prim = f.get('primaries', None)
-        mu = f.get('muons', None)
-        counts = f.get('counts', None)
-        if prim is not None:
-            print(f"primaries.shape={prim.shape} dtype={prim.dtype}")
-        if mu is not None:
-            print(f"muons.shape={mu.shape} dtype={mu.dtype}")
-        if counts is not None:
-            print(f"counts.shape={counts.shape} dtype={counts.dtype}")
-
-        if prim is None or counts is None:
-            return
-
-        n_events = min(int(prim.shape[0]), int(counts.shape[0]), max_events)
-        # Build offsets from counts so we can preview muon slices
-        counts_arr = counts[:n_events]
-        start = 0
-        for i in range(n_events):
-            c = int(counts_arr[i])
-            p = prim[i]
-            m_slice = mu[start:start + c] if (mu is not None and c > 0) else None
-            first_mu = None
-            if m_slice is not None and len(m_slice) > 0:
-                first_mu = m_slice[0].tolist() if hasattr(m_slice[0], 'tolist') else m_slice[0]
-            print(f"event[{i}] primary={p.tolist() if hasattr(p,'tolist') else p} count={c} first_muon={first_mu}")
-            start += c
-
-    if fs:
-        with fs.open(file_path, 'rb') as remote_f:
-            with h5py.File(remote_f, 'r') as f:
-                _preview_h5(f)
-    else:
-        with h5py.File(file_path, 'r') as f:
-            _preview_h5(f)
-
-def get_filesystem(federation_url, token):
-    if federation_url:
-        try:
-            from pelicanfs.core import PelicanFileSystem
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            return PelicanFileSystem(federation_url, headers=headers)
-        except ImportError:
-            print("Warning: pelicanfs not found, falling back to local filesystem")
-            return None
-    return None
-
-
-def _select_checkpoint_fs(path: str | None, *, fs, mode: str) -> object | None:
-    """Select filesystem for checkpoint/model-checkpoint IO.
-
-    mode:
-      - "auto": use fs only for pelican:// paths
-      - "local": always use local filesystem
-      - "pelican": always use provided fs (if any)
-    """
-    if not path:
-        return None
-    mode = (mode or "auto").lower()
-    if mode == "local":
-        return None
-    if mode == "pelican":
-        return fs
-    # auto
-    return fs if _is_pelican_path(str(path)) else None
-
-def load_progress(checkpoint_path, fs=None) -> tuple[int, set[str]]:
-    """Load progress tracking.
-
-    Backward compatible:
-      - Old format: {"processed_files": [...]} (implicit epoch=0)
-      - New format: {"epoch": int, "processed_files": [...]} (epoch is the current epoch)
-    """
-    processed_files: set[str] = set()
-    epoch = 0
-
-    def _parse(data: object) -> None:
-        nonlocal epoch, processed_files
-        if isinstance(data, dict):
-            epoch = int(data.get("epoch", 0) or 0)
-            processed_files = set(data.get("processed_files", []) or [])
-
-    if fs:
-        try:
-            if fs.exists(checkpoint_path):
-                with fs.open(checkpoint_path, 'r') as f:
-                    _parse(json.load(f))
-        except Exception as e:
-            print(f"Warning: Could not read checkpoint from Pelican: {e}")
-    elif checkpoint_path and os.path.exists(checkpoint_path):
-        with open(checkpoint_path, 'r') as f:
-            try:
-                _parse(json.load(f))
-            except json.JSONDecodeError:
-                print(f"Warning: Could not decode checkpoint file {checkpoint_path}")
-
-    return epoch, processed_files
-
-def save_progress(checkpoint_path, epoch: int, processed_files: set[str], fs=None) -> None:
-    if not checkpoint_path:
-        return
-    payload = {"epoch": int(epoch), "processed_files": list(processed_files)}
-    if fs:
-        try:
-            _fs_put_json(fs, checkpoint_path, payload)
-        except Exception as e:
-            print(f"Warning: Could not save checkpoint to Pelican: {e}")
-    else:
-        with open(checkpoint_path, 'w') as f:
-            json.dump(payload, f)
-
-def save_model_checkpoint(path, gen, crit, opt_G, opt_C, epoch=0, fs=None):
-    checkpoint_data = {
-        'gen_state_dict': gen.state_dict(),
-        'crit_state_dict': crit.state_dict(),
-        'opt_G_state_dict': opt_G.state_dict(),
-        'opt_C_state_dict': opt_C.state_dict(),
-        'epoch': epoch
-    }
-    
-    if fs:
-        try:
-            _fs_put_torch_checkpoint(fs, path, checkpoint_data)
-            print(f"Model checkpoint saved to Pelican: {path}")
-        except Exception as e:
-            print(f"Warning: Could not save model checkpoint to Pelican: {e}")
-    else:
-        torch.save(checkpoint_data, path)
-        print(f"Model checkpoint saved to {path}")
-
-def load_model_checkpoint(path, gen, crit, opt_G, opt_C, device, fs=None):
-    checkpoint = None
-    if fs:
-        try:
-            if fs.exists(path):
-                with fs.open(path, 'rb') as f:
-                    checkpoint = torch.load(f, map_location=device)
-                    print(f"Model checkpoint loaded from Pelican: {path}")
-        except Exception as e:
-            print(f"Warning: Could not load model checkpoint from Pelican: {e}")
-    elif path and os.path.exists(path):
-        checkpoint = torch.load(path, map_location=device)
-        print(f"Model checkpoint loaded from {path}")
-
-    if checkpoint:
-        gen.load_state_dict(checkpoint['gen_state_dict'])
-        crit.load_state_dict(checkpoint['crit_state_dict'])
-        opt_G.load_state_dict(checkpoint['opt_G_state_dict'])
-        opt_C.load_state_dict(checkpoint['opt_C_state_dict'])
-        return checkpoint.get('epoch', 0)
-    return 0
 
 def main(args):
     # Normalize inputs
@@ -952,16 +66,16 @@ def main(args):
     inferred_fed = args.federation_url
     if inferred_fed is None:
         for p in (raw_infiles + checkpoint_paths):
-            if _is_pelican_path(p):
-                inferred_fed = _infer_pelican_federation_url(p)
+            if is_pelican_path(p):
+                inferred_fed = infer_pelican_federation_url(p)
                 break
     if args.federation_url is None and inferred_fed is not None:
         args.federation_url = inferred_fed
 
     # If pelican paths are present but no token flow is enabled, warn early.
     # Prefer checkpoint paths for scope inference (they may require write access).
-    pelican_paths_all = [p for p in (checkpoint_paths + raw_infiles) if _is_pelican_path(p)]
-    pelican_checkpoint_paths = [p for p in checkpoint_paths if _is_pelican_path(p)]
+    pelican_paths_all = [p for p in (checkpoint_paths + raw_infiles) if is_pelican_path(p)]
+    pelican_checkpoint_paths = [p for p in checkpoint_paths if is_pelican_path(p)]
     if pelican_paths_all and (args.token is None) and (not args.auto_token):
         print(
             "Warning: pelican:// paths detected but no --token provided and --auto-token is not set. "
@@ -980,13 +94,13 @@ def main(args):
 
             scope_path = args.pelican_scope_path
             if not scope_path:
-                scope_path = _infer_scope_path_from_pelican_uri(
+                scope_path = infer_scope_path_from_pelican_uri(
                     pelican_paths[0],
                     storage_prefix=args.pelican_storage_prefix,
                 )
 
             print(f"Fetching Pelican token for scope: {scope_path}")
-            args.token = _fetch_pelican_token_via_helper(
+            args.token = fetch_pelican_token_via_helper(
                 scope_path=scope_path,
                 federation_url=args.federation_url,
                 oidc_url=args.pelican_oidc_url,
@@ -1008,8 +122,8 @@ def main(args):
     fs = get_filesystem(args.federation_url, args.token)
 
     # Checkpoint/model-checkpoint IO may be local even when inputs are pelican://
-    checkpoint_fs = _select_checkpoint_fs(args.checkpoint, fs=fs, mode=getattr(args, "checkpoint_io", "auto"))
-    model_checkpoint_fs = _select_checkpoint_fs(
+    checkpoint_fs = select_checkpoint_fs(args.checkpoint, fs=fs, mode=getattr(args, "checkpoint_io", "auto"))
+    model_checkpoint_fs = select_checkpoint_fs(
         args.model_checkpoint,
         fs=fs,
         mode=getattr(args, "checkpoint_io", "auto"),
@@ -1018,11 +132,59 @@ def main(args):
     # Print-only mode: preview file contents and exit
     if args.print_file_contents:
         for p in [str(x) for x in args.infiles]:
-            _print_file_contents(p, fs=fs, max_events=args.print_max_events)
+            print_file_contents(p, fs=fs, max_events=args.print_max_events)
         return
 
-    device = _select_torch_device(args.device)
-    print(f"Using device: {device} ({_device_backend_label(device)})")
+    device = select_torch_device(args.device)
+    print(f"Using device: {device} ({device_backend_label(device)})")
+
+    # Optional: enable TF32 on supported CUDA hardware, with clear warnings otherwise
+    tf32_enabled = False
+    if bool(getattr(args, "allow_tf32", False)):
+        if not str(device).startswith("cuda"):
+            print("Warning: --allow-tf32 was set but device is not CUDA; ignoring.")
+        else:
+            major = minor = 0
+            try:
+                dev_index = torch.cuda.current_device()
+                major, minor = torch.cuda.get_device_capability(dev_index)
+            except Exception:
+                pass
+            if major < 8:
+                print(f"Warning: --allow-tf32 was set but GPU sm{major}{minor} does not support TF32; ignoring.")
+            else:
+                try:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                    torch.backends.cudnn.allow_tf32 = True
+                    if hasattr(torch, "set_float32_matmul_precision"):
+                        torch.set_float32_matmul_precision("high")
+                    tf32_enabled = True
+                    print("TF32 enabled for CUDA matmuls/cuDNN")
+                except Exception:
+                    print("Warning: failed to enable TF32; continuing without it.")
+
+    # Start background GPU usage tracker for time-averaged reporting
+    gpu_tracker = GPUUsageTracker(device, sample_interval=0.1, window_size=600)
+    gpu_tracker.start()
+
+    # Print GP tuning info if enabled
+    lambda_gp = float(getattr(args, "lambda_gp", 0.0) or 0.0)
+    if lambda_gp > 0:
+        gp_max = int(getattr(args, "gp_max_pairs", 0) or 0)
+        gp_frac = float(getattr(args, "gp_sample_fraction", 0.0) or 0.0)
+        gp_every = int(getattr(args, "gp_every", 1) or 1)
+        gp_info_parts = [f"λ={lambda_gp}"]
+        if gp_max > 0:
+            gp_info_parts.append(f"max_pairs={gp_max}")
+        if gp_frac > 0.0:
+            gp_info_parts.append(f"sample_frac={gp_frac:.2f}")
+        if gp_every > 1:
+            gp_info_parts.append(f"every={gp_every}")
+        print(f"Gradient penalty: {', '.join(gp_info_parts)}")
+    
+    # Print config summary for easy reference
+    pooling_mode = str(getattr(args, "critic_pooling", "amax") or "amax").lower()
+    print(f"Config: critic_pooling={pooling_mode}, tf32={'enabled' if tf32_enabled else 'disabled'}")
 
     writer = None
     tb_dir = None
@@ -1041,6 +203,14 @@ def main(args):
             writer.add_text("run/args", json.dumps(vars(args), indent=2, default=str), 0)
         except Exception:
             pass
+        # Log configuration flags for easy comparison in TensorBoard
+        try:
+            pooling_mode = str(getattr(args, "critic_pooling", "amax") or "amax").lower()
+            writer.add_text("config/critic_pooling", pooling_mode, 0)
+            writer.add_scalar("config/critic_pooling_mean", 1.0 if pooling_mode == "mean" else 0.0, 0)
+            writer.add_scalar("cuda/tf32_enabled", 1.0 if tf32_enabled else 0.0, 0)
+        except Exception:
+            pass
         print(f"TensorBoard logging enabled: {tb_dir}")
 
     # Optional: sync TB event files to another location (local dir or pelican://)
@@ -1054,7 +224,7 @@ def main(args):
         if writer is None or tb_dir is None or run_name is None:
             raise ValueError("--tb-sync-to requires --tb-logdir to be set")
 
-        tb_sync_fs = _select_checkpoint_fs(tb_sync_to, fs=fs, mode=getattr(args, "tb_io", "auto"))
+        tb_sync_fs = select_checkpoint_fs(tb_sync_to, fs=fs, mode=getattr(args, "tb_io", "auto"))
         if tb_sync_fs is None:
             # Local destination
             tb_sync_base = os.path.join(str(tb_sync_to), str(run_name))
@@ -1107,7 +277,7 @@ def main(args):
                 else:
                     dest_path = posixpath.join(str(tb_sync_base), rel.replace(os.sep, "/"))
                     try:
-                        _fs_put_file(tb_sync_fs, dest_path, local_path)
+                        fs_put_file(tb_sync_fs, dest_path, local_path)
                         tb_uploaded[rel] = sig
                     except Exception:
                         continue
@@ -1125,7 +295,8 @@ def main(args):
     crit = ScalableCritic(
         feat_dim=args.feat_dim, 
         cond_dim=args.cond_dim, 
-        device=device
+        device=device,
+        pooling_mode=str(getattr(args, "critic_pooling", "amax") or "amax")
     ).to(device)
 
     # Optional: torch.compile (PyTorch 2.x). This can improve GPU utilization by
@@ -1190,8 +361,21 @@ def main(args):
             except Exception as e:
                 print(f"Warning: torch.compile failed ({e}); continuing without compilation.")
     
-    opt_G = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    opt_C = optim.Adam(crit.parameters(), lr=1e-4, betas=(0.0, 0.9))
+    # Instantiate optimizers
+    optimizer_type = str(getattr(args, "optimizer", "adam") or "adam").lower()
+    lr = float(getattr(args, "lr", 1e-4) or 1e-4)
+    
+    if optimizer_type == "sgd":
+        momentum = float(getattr(args, "momentum", 0.9) or 0.9)
+        opt_G = optim.SGD(gen.parameters(), lr=lr, momentum=momentum, dampening=0, nesterov=False)
+        opt_C = optim.SGD(crit.parameters(), lr=lr, momentum=momentum, dampening=0, nesterov=False)
+        print(f"Using SGD optimizer: lr={lr}, momentum={momentum}")
+    elif optimizer_type == "adam":
+        opt_G = optim.Adam(gen.parameters(), lr=lr, betas=(0.0, 0.9))
+        opt_C = optim.Adam(crit.parameters(), lr=lr, betas=(0.0, 0.9))
+        print(f"Using Adam optimizer: lr={lr}")
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type}. Choose 'adam' or 'sgd'.")
 
     # Initialize Filesystem for Checkpoints
     # (already initialized above)
@@ -1217,9 +401,9 @@ def main(args):
     print(f"Remaining: {len(files_to_process)}")
 
     # Optional: prefetch pelican:// inputs to local disk.
-    prefetcher: _PelicanPrefetcher | None = None
+    prefetcher: PelicanPrefetcher | None = None
     if getattr(args, "prefetch_dir", None):
-        pelican_candidates = [str(p) for p in files_to_process if _is_pelican_path(p)]
+        pelican_candidates = [str(p) for p in files_to_process if is_pelican_path(p)]
         max_files = int(getattr(args, "prefetch_max_files", 0) or 0)
         if max_files > 0:
             pelican_candidates = pelican_candidates[:max_files]
@@ -1236,7 +420,7 @@ def main(args):
                 print(
                     f"Starting background prefetch: ahead={ahead}, max_files={max_files or 'all'}, cache={args.prefetch_dir}"
                 )
-                prefetcher = _PelicanPrefetcher(
+                prefetcher = PelicanPrefetcher(
                     pelican_candidates,
                     federation_url=args.federation_url,
                     token=args.token,
@@ -1248,7 +432,7 @@ def main(args):
                 print(
                     f"Prefetching {len(pelican_candidates)} pelican:// files to {args.prefetch_dir} (blocking)"
                 )
-                _prefetch_pelican_files(
+                prefetch_pelican_files(
                     pelican_candidates,
                     fs=fs,
                     cache_dir=args.prefetch_dir,
@@ -1260,7 +444,7 @@ def main(args):
     outlier_writer = None
     outliers_dir = getattr(args, "outliers_dir", None)
     if outliers_dir:
-        outlier_writer = _OutlierParquetWriter(str(outliers_dir))
+        outlier_writer = OutlierParquetWriter(str(outliers_dir))
         ev_thr = int(getattr(args, "max_muons_per_event", 0) or 0)
         thr_label = "--max-muons-per-event" if ev_thr > 0 else "--max-muons-per-batch"
         thr_val = ev_thr if ev_thr > 0 else int(getattr(args, "max_muons_per_batch", 0) or 0)
@@ -1273,6 +457,7 @@ def main(args):
         print(f"In-memory parquet cache enabled: {mem_cache_mb} MiB (process-local)")
 
     train_steps_done = 0
+    first_batch_printed = False  # Track if we've printed the first batch
     file_pbar = tqdm(files_to_process, desc="Files", unit="file")
     for file_idx, file_path in enumerate(file_pbar, start=1):
         file_pbar.set_description(f"Processing {os.path.basename(file_path)}")
@@ -1286,8 +471,8 @@ def main(args):
 
         read_path = file_path
         cached_local_path = None
-        if getattr(args, "prefetch_dir", None) and _is_pelican_path(file_path):
-            cached = _pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir)
+        if getattr(args, "prefetch_dir", None) and is_pelican_path(file_path):
+            cached = pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir)
             cached_local_path = cached
             if prefetcher is not None and file_path in prefetcher.uri_to_index:
                 prefetcher.update_current_uri(file_path)
@@ -1304,21 +489,21 @@ def main(args):
             tqdm.write(f"[file {file_idx}/{len(files_to_process)}] read_path={read_path}")
 
         # Fail fast with a more actionable message than a deep h5py traceback.
-        if not _is_pelican_path(read_path) and not os.path.exists(read_path):
+        if not is_pelican_path(read_path) and not os.path.exists(read_path):
             raise FileNotFoundError(
                 f"Input file not found: {read_path}\n"
                 "If this is a host filesystem path (e.g. /icecube/...), make sure it is available/mounted in your environment.\n"
                 "If you intended to read via Pelican, pass a pelican:// URI (and optionally --federation-url/--token)."
             )
 
-        file_format = _infer_file_format(read_path)
+        file_format = infer_file_format(read_path)
 
-        fed_for_read = args.federation_url if _is_pelican_path(read_path) else None
-        token_for_read = args.token if _is_pelican_path(read_path) else None
+        fed_for_read = args.federation_url if is_pelican_path(read_path) else None
+        token_for_read = args.token if is_pelican_path(read_path) else None
 
         # Parquet and pelican:// inputs require the HF streaming loader in this repo.
-        use_hf_for_file = bool(args.use_hf) or file_format == "parquet" or _is_pelican_path(read_path)
-        if (not args.use_hf) and use_hf_for_file and (file_format == "parquet" or _is_pelican_path(read_path)):
+        use_hf_for_file = bool(args.use_hf) or file_format == "parquet" or is_pelican_path(read_path)
+        if (not args.use_hf) and use_hf_for_file and (file_format == "parquet" or is_pelican_path(read_path)):
             print(
                 f"Info: using HF streaming loader for {file_format} input: {read_path} "
                 "(add --use-hf to enable this explicitly)."
@@ -1393,13 +578,16 @@ def main(args):
         data_iter = iter(dataloader)
         batch_prefetch = int(getattr(args, "prefetch_batches", 0) or 0)
         if batch_prefetch > 0:
-            data_iter = _PrefetchIterator(data_iter, max_prefetch=batch_prefetch)
+            data_iter = PrefetchIterator(data_iter, max_prefetch=batch_prefetch)
         batch_pbar = tqdm(desc="Batches", unit="batch", leave=False)
         batches_seen = 0
         events_seen = 0
         muons_seen = 0
         skipped_empty = 0
         reported_first_batch = False
+
+        profile_steps = int(getattr(args, "profile_steps", 0) or 0)
+        steps_profiled = 0
 
         file_t0 = time.perf_counter()
         load_time_s = 0.0
@@ -1419,8 +607,13 @@ def main(args):
             batches_seen += 1
             batch_pbar.update(1)
 
-            events_seen += int(counts.numel())
-            muons_seen += int(counts.sum().item())
+            # Batch GPU→CPU transfers: pull counts once, reuse throughout batch processing
+            counts_cpu = counts.detach().cpu()
+            counts_sum_val = int(counts_cpu.sum().item())
+            counts_numel_val = int(counts.numel())
+            
+            events_seen += counts_numel_val
+            muons_seen += counts_sum_val
             # Preserve raw tensors for optional outlier capture.
             prims_raw = prims
             real_muons_raw = real_muons
@@ -1451,9 +644,10 @@ def main(args):
 
                         # Write outliers (raw columns, before ID stripping).
                         if outlier_writer is not None:
+                            counts_for_outlier = counts_cpu.tolist()  # Reuse CPU-side counts
                             for ev in oversize_idx:
                                 try:
-                                    c = int(counts[ev].item())
+                                    c = int(counts_for_outlier[ev])
                                     m_evt = (batch_idx == int(ev))
                                     mu_evt = real_muons_raw[m_evt]
                                     _ = outlier_writer.write_event(
@@ -1490,6 +684,7 @@ def main(args):
                         batch_idx = old_to_new[batch_idx[mu_keep]]
                         prims_raw = prims_raw[keep_mask]
                         counts = counts[keep_mask]
+                        counts_cpu = counts.detach().cpu()  # Re-pull counts after filtering
                 except Exception:
                     # If anything goes wrong, fall back to the original batch.
                     pass
@@ -1512,18 +707,18 @@ def main(args):
             # Optional: report a small signature so you can confirm data changes across files.
             # Must run after *_feats are defined.
             if (not reported_first_batch) and bool(getattr(args, "report_first_batch", False)):
-                if real_muons_feats.numel() > 0 and int(counts.sum().item()) > 0:
-                    sig = _first_batch_signature(prims_feats, real_muons_feats, counts)
-                    c_preview = counts[:8].detach().to("cpu").tolist()
+                if real_muons_feats.numel() > 0 and counts_sum_val > 0:
+                    sig = first_batch_signature(prims_feats, real_muons_feats, counts)
+                    c_preview = counts_cpu[:8].tolist()
                     tqdm.write(
                         f"[file {file_idx}/{len(files_to_process)}] first_batch signature={sig} "
-                        f"events={int(counts.numel())} muons={int(counts.sum().item())} counts[:8]={c_preview}"
+                        f"events={counts_numel_val} muons={counts_sum_val} counts[:8]={c_preview}"
                     )
                     reported_first_batch = True
 
             # Some events (or entire batches) can have zero muons. WGAN training
             # requires at least one real sample to compute losses and gradient penalty.
-            if real_muons_feats.numel() == 0 or int(counts.sum().item()) == 0:
+            if real_muons_feats.numel() == 0 or counts_sum_val == 0:
                 skipped_empty += 1
                 continue
 
@@ -1538,6 +733,8 @@ def main(args):
                 sub_prims_feats: torch.Tensor,
                 sub_counts: torch.Tensor,
             ):
+                nonlocal steps_profiled
+                
                 sub_muons_feats = sub_muons_feats.to(device, non_blocking=non_blocking)
                 sub_batch_idx = sub_batch_idx.to(device, non_blocking=non_blocking)
                 sub_prims_feats = sub_prims_feats.to(device, non_blocking=non_blocking)
@@ -1547,7 +744,49 @@ def main(args):
                 sub_muons_norm = normalizer.normalize_features(sub_muons_feats)
                 sub_prims_norm = normalizer.normalize_primaries(sub_prims_feats)
 
-                c_loss_local, g_loss_local = train_step_scalable(
+                # Print first 10 samples (normalized vs unnormalized) for debugging
+                nonlocal first_batch_printed
+                if (not first_batch_printed) and (sub_muons_feats.numel() > 0):
+                    first_batch_printed = True
+                    n_show = min(10, int(sub_muons_feats.shape[0]))
+                    tqdm.write("\n" + "="*80)
+                    tqdm.write("[First Training Batch Sample Inspector]")
+                    tqdm.write("="*80)
+                    
+                    # Muons: show feature dimensions
+                    tqdm.write(f"\n--- Muon Features (first {n_show} samples) ---")
+                    tqdm.write("Unnormalized:")
+                    for i in range(n_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_muons_feats[i].cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("\nNormalized:")
+                    for i in range(n_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_muons_norm[i].detach().cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    
+                    # Primaries: show all available events (up to 10)
+                    n_prims_show = min(10, int(sub_prims_feats.shape[0]))
+                    tqdm.write(f"\n--- Primary Features (first {n_prims_show} events) ---")
+                    tqdm.write("Unnormalized:")
+                    for i in range(n_prims_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_prims_feats[i].cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("\nNormalized:")
+                    for i in range(n_prims_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_prims_norm[i].detach().cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("="*80 + "\n")
+
+                # Profiling hook (optional)
+                should_profile = (profile_steps > 0 and steps_profiled < profile_steps)
+                if should_profile:
+                    prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        record_shapes=True,
+                    )
+                    prof.__enter__()
+
+                c_loss_local, g_loss_local, m_loss_local = train_step_scalable(
                     gen,
                     crit,
                     opt_G,
@@ -1558,31 +797,49 @@ def main(args):
                     sub_counts,
                     lambda_gp=args.lambda_gp,
                     critic_steps=int(getattr(args, "critic_steps", 1) or 1),
+                    gp_max_pairs=int(getattr(args, "gp_max_pairs", 0) or 0),
+                    gp_sample_fraction=float(getattr(args, "gp_sample_fraction", 0.0) or 0.0),
+                    gp_every=int(getattr(args, "gp_every", 1) or 1),
+                    grad_clip_norm=float(getattr(args, "grad_clip_norm", 0.0) or 0.0),
                     device=device,
                 )
-                return c_loss_local, g_loss_local, sub_muons_norm, sub_prims_norm, sub_counts
+
+                if should_profile:
+                    prof.__exit__(None, None, None)
+                    try:
+                        tqdm.write(f"[Profile step {steps_profiled+1}/{profile_steps}]")
+                        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15)
+                        tqdm.write(table)
+                    except Exception as e:
+                        tqdm.write(f"[Profile error: {e}]")
+                    steps_profiled += 1
+
+                return c_loss_local, g_loss_local, m_loss_local, sub_muons_norm, sub_prims_norm, sub_counts
 
             # Default: single step on the full batch.
-            if max_muons <= 0 or int(counts.sum().item()) <= max_muons:
-                c_loss, g_loss, real_muons_norm, prims_norm, counts_dev = _run_substep(
+            if max_muons <= 0 or counts_sum_val <= max_muons:
+                c_loss, g_loss, m_loss, real_muons_norm, prims_norm, counts_dev = _run_substep(
                     real_muons_feats, batch_idx, prims_feats, counts
                 )
                 train_steps_done += 1
             else:
                 # Microbatch by contiguous event ranges so batch_idx slicing is cheap.
-                bsz = int(counts.numel())
+                bsz = counts_numel_val
                 start_ev = 0
                 last_c = None
                 last_g = None
+                last_m = None
                 last_real_norm = None
                 last_prims_norm = None
                 last_counts_dev = None
+                # Batch transfer of counts to CPU for fast loop iteration
+                counts_cpu_list = counts_cpu.tolist()
                 while start_ev < bsz:
                     # Choose an end_ev so sum(counts[start_ev:end_ev]) <= max_muons, at least 1 event.
                     cum = 0
                     end_ev = start_ev
                     while end_ev < bsz:
-                        c = int(counts[end_ev].item())
+                        c = counts_cpu_list[end_ev]
                         # Corner case: a single event can exceed max_muons. In that case,
                         # microbatching cannot bound memory, so we skip the event to avoid
                         # catastrophic allocation spikes that can ratchet reserved memory upward.
@@ -1603,19 +860,22 @@ def main(args):
                         end_ev = start_ev + 1
 
                     sub_counts = counts[start_ev:end_ev]
-                    if event_muon_limit > 0 and int(sub_counts.max().item()) > event_muon_limit:
+                    sub_counts_cpu = counts_cpu[start_ev:end_ev]
+                    sub_counts_max = int(sub_counts_cpu.max().item())
+                    if event_muon_limit > 0 and sub_counts_max > event_muon_limit:
                         # We already counted this as oversize; treat as skipped.
                         skipped_empty += 1
                         start_ev = end_ev
                         continue
                     # Skip all-zero microbatches (can happen with many 0-muon events).
-                    if int(sub_counts.sum().item()) > 0:
+                    sub_counts_sum = int(sub_counts_cpu.sum().item())
+                    if sub_counts_sum > 0:
                         sub_prims = prims_feats[start_ev:end_ev]
                         m = (batch_idx >= start_ev) & (batch_idx < end_ev)
                         sub_muons = real_muons_feats[m]
                         sub_bidx = batch_idx[m] - start_ev
                         if sub_muons.numel() > 0:
-                            last_c, last_g, last_real_norm, last_prims_norm, last_counts_dev = _run_substep(
+                            last_c, last_g, last_m, last_real_norm, last_prims_norm, last_counts_dev = _run_substep(
                                 sub_muons, sub_bidx, sub_prims, sub_counts
                             )
                             train_steps_done += 1
@@ -1638,7 +898,7 @@ def main(args):
             t_step1 = time.perf_counter()
             step_time_s += (t_step1 - t_step0)
 
-            batch_pbar.set_postfix(c_loss=f"{c_loss:.4f}", g_loss=f"{g_loss:.4f}")
+            batch_pbar.set_postfix(c_loss=f"{c_loss:.4f}", g_loss=f"{g_loss:.4f}", m_loss=f"{m_loss:.4f}")
 
             # TensorBoard logging (optional)
             if writer is not None:
@@ -1649,6 +909,7 @@ def main(args):
                     avg_step_ms = (step_time_s / max(1, batches_seen)) * 1e3
                     writer.add_scalar("train/c_loss", float(c_loss), train_steps_done)
                     writer.add_scalar("train/g_loss", float(g_loss), train_steps_done)
+                    writer.add_scalar("train/m_loss", float(m_loss), train_steps_done)
                     writer.add_scalar("perf/avg_load_ms", float(avg_load_ms), train_steps_done)
                     writer.add_scalar("perf/avg_step_ms", float(avg_step_ms), train_steps_done)
                     writer.add_scalar("perf/batch_per_s", float(batches_seen / elapsed), train_steps_done)
@@ -1662,12 +923,15 @@ def main(args):
                         train_steps_done,
                     )
                     try:
-                        writer.add_scalar("data/mean_counts", float(counts.float().mean().item()), train_steps_done)
-                        writer.add_scalar("data/max_counts", float(counts.max().item()), train_steps_done)
+                        # Batch .item() calls: pull stats once
+                        mean_counts_val = float(counts_cpu.float().mean().item())
+                        max_counts_val = float(counts_cpu.max().item())
+                        writer.add_scalar("data/mean_counts", mean_counts_val, train_steps_done)
+                        writer.add_scalar("data/max_counts", max_counts_val, train_steps_done)
                     except Exception:
                         pass
 
-                    mem = _cuda_mem_stats(device)
+                    mem = gpu_tracker.get_averaged_stats()
                     if mem is not None:
                         writer.add_scalar("cuda/alloc_mib", float(mem["alloc_mib"]), train_steps_done)
                         writer.add_scalar("cuda/reserved_mib", float(mem["reserved_mib"]), train_steps_done)
@@ -1744,7 +1008,7 @@ def main(args):
                 mps = muons_seen / elapsed
                 avg_load_ms = (load_time_s / max(1, batches_seen)) * 1e3
                 avg_step_ms = (step_time_s / max(1, batches_seen)) * 1e3
-                mem = _cuda_mem_stats(device)
+                mem = gpu_tracker.get_averaged_stats()
                 mem_s = ""
                 if mem is not None:
                     try:
@@ -1754,10 +1018,21 @@ def main(args):
                     free = mem.get("free_mib", float("nan"))
                     active = mem.get("active_mib", float("nan"))
                     inact = mem.get("inactive_split_mib", float("nan"))
+                    total = mem.get("total_mib", float("nan"))
+                    alloc = mem.get("alloc_mib", 0)
+                    usage_pct = float("nan")
+                    try:
+                        total_f = float(total)
+                        alloc_f = float(alloc)
+                        if total_f == total_f and total_f > 0:
+                            usage_pct = (alloc_f / total_f) * 100.0
+                    except Exception:
+                        pass
                     mem_s = (
                         f" cuda:{dev_idx} alloc={mem['alloc_mib']:.0f}MiB res={mem['reserved_mib']:.0f}MiB"
                         f" max_alloc={mem['max_alloc_mib']:.0f}MiB"
                         f" active={active:.0f}MiB inact_split={inact:.0f}MiB free={free:.0f}MiB"
+                        f" usage={usage_pct:.1f}%"
                     )
                 tqdm.write(
                     f"[file {file_idx}/{len(files_to_process)}] batches={batches_seen} "
@@ -1765,7 +1040,7 @@ def main(args):
                     f"skipped_empty={skipped_empty} skipped_oversize={skipped_oversize} written_oversize={written_oversize} "
                     f"rate: {bps:.2f} batch/s {eps:.1f} evt/s {mps:.1f} mu/s "
                     f"avg: load={avg_load_ms:.1f}ms step={avg_step_ms:.1f}ms "
-                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f}"
+                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f}"
                     f"{mem_s}"
                 )
 
@@ -1804,6 +1079,9 @@ def main(args):
         except Exception:
             pass
         writer.close()
+    
+    # Stop the GPU usage tracker
+    gpu_tracker.stop()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1937,6 +1215,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help=(
+            "Enable TensorFloat-32 for CUDA matmuls/cuDNN (Ampere+). Can improve GEMM/conv throughput with minor precision tradeoffs."
+        ),
+    )
+    parser.add_argument(
         "--log-interval",
         type=int,
         default=50,
@@ -1993,6 +1278,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "local", "pelican"],
         help="Where to write TensorBoard sync output (auto/local/pelican). Default: auto.",
+    )
+    parser.add_argument(
+        "--critic-pooling",
+        type=str,
+        default="amax",
+        choices=["amax", "mean"],
+        help=(
+            "Pooling mode for critic event aggregation: 'amax' (default) or 'mean'. 'mean' is cheaper to backpropagate."
+        ),
     )
     parser.add_argument(
         "--report-first-batch",
@@ -2137,6 +1431,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max number of events to print per file when using --print-file-contents.",
     )
     
+    # Optimizer Hyperparameters
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adam",
+        choices=["adam", "sgd"],
+        help=(
+            "Optimizer to use: 'adam' (default) or 'sgd'. "
+            "SGD is faster (fewer GPU ops per step) but may require careful LR tuning."
+        ),
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for optimizer (default: 1e-4).",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="Momentum for SGD optimizer (default: 0.9, only used when --optimizer sgd).",
+    )
+    
     # Model Hyperparameters
     parser.add_argument(
         "--cond-dim",
@@ -2173,6 +1491,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=10.0,
         help="Gradient penalty weight",
+    )
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, apply gradient clipping (L2 norm) to generator and critic, including multiplicity step. "
+            "Helps stabilize SGD and prevent NaNs. Default: 0 (disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--gp-max-pairs",
+        type=int,
+        default=4096,
+        help=(
+            "Cap the number of interpolated muon pairs used for gradient penalty per step (default: 4096). "
+            "Set 0 to disable capping."
+        ),
+    )
+    parser.add_argument(
+        "--gp-sample-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0 and <1, randomly sample this fraction of aligned real/fake muon pairs for the gradient penalty. "
+            "Applied after --gp-max-pairs (default: 0.0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--gp-every",
+        type=int,
+        default=2,
+        help=(
+            "Apply gradient penalty every N critic steps (default: 2). Set to 1 for every step."
+        ),
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=0,
+        help=(
+            "If >0, profile the first N training steps using torch.profiler and print timing breakdown. "
+            "Useful for identifying bottlenecks (default: 0 disables)."
+        ),
     )
 
     return parser
