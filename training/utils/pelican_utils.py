@@ -340,16 +340,37 @@ def expand_pelican_wildcards(
             # Prefer glob() if supported by the filesystem.
             matches: list[str] = []
             glob_fn = getattr(fs, "glob", None)
+            has_recursive = "**" in item
+            
             if callable(glob_fn):
                 try:
-                    res = glob_fn(item)
+                    # For pelicanfs, pass detail=False to get list of paths instead of dicts
+                    # This significantly improves performance for large recursive globs with **
+                    import inspect
+                    sig = inspect.signature(glob_fn)
+                    if 'detail' in sig.parameters:
+                        res = glob_fn(item, detail=False)
+                    else:
+                        res = glob_fn(item)
                     if isinstance(res, (list, tuple)):
                         matches = [str(x) for x in res]
-                except Exception:
+                except Exception as glob_err:
+                    # If glob fails on a recursive pattern, raise immediately
+                    if has_recursive:
+                        raise RuntimeError(
+                            f"Failed to expand recursive wildcard pattern '{item}'. "
+                            f"Check:\n"
+                            f"  - Federation URL is correct (--federation-url {inferred_fed})\n"
+                            f"  - Base path exists in Pelican (try without **/*.parquet first)\n"
+                            f"  - Token is valid and not expired (use --auto-token or --token)\n"
+                            f"  - Director is reachable\n"
+                            f"Error: {type(glob_err).__name__}: {glob_err}"
+                        ) from glob_err
+                    # For simple patterns, fall back to ls()
                     matches = []
 
-            # Fallback: ls(dir) + fnmatch on basename.
-            if not matches:
+            # Fallback: ls(dir) + fnmatch on basename (only for non-recursive patterns).
+            if not matches and not has_recursive:
                 dir_uri, basename_pat = pelican_uri_dir_and_pattern(item)
                 ls_fn = getattr(fs, "ls", None)
                 if not callable(ls_fn):
@@ -373,6 +394,14 @@ def expand_pelican_wildcards(
                 else:
                     paths = [str(e) for e in (entries or [])]
                 matches = [p for p in paths if fnmatch.fnmatch(posixpath.basename(p), basename_pat)]
+            elif not matches and has_recursive:
+                # Recursive pattern but no matches from glob()
+                raise FileNotFoundError(
+                    f"Recursive wildcard pattern matched 0 files: {item}\n"
+                    f"Check:\n"
+                    f"  - Base path exists: {item.split('**')[0]}\n"
+                    f"  - Files match the pattern in subdirectories"
+                )
 
             # Normalize matches to full pelican:// URIs. Some filesystem backends
             # return plain paths like "/icecube/..." or "icecube/...".
@@ -427,10 +456,31 @@ def infer_scope_path_from_pelican_uri(pelican_uri: str, *, storage_prefix: str =
         if not path:
             path = "/"
 
-    # If the last path component looks like a filename or contains globs, scope to the directory.
-    base = posixpath.basename(path)
-    if has_wildcards(base) or ("." in base and not base.endswith(".")):
-        path = posixpath.dirname(path) or "/"
+    # Strip ALL wildcards and range patterns from the path to find the base directory for token scope.
+    # Token for a parent directory grants access to all subdirectories.
+    # Find the first path component that contains wildcards or range patterns and use the parent directory.
+    import re
+    range_pattern = re.compile(r'^\d{7}-\d{7}$')  # Matches patterns like 0000000-0000999
+    
+    parts = path.split("/")
+    clean_parts = []
+    for part in parts:
+        # Stop at the first component with any wildcard pattern or range directory
+        if has_wildcards(part) or range_pattern.match(part):
+            break
+        clean_parts.append(part)
+    
+    # Reconstruct the clean path
+    if clean_parts:
+        path = "/".join(clean_parts)
+    else:
+        path = "/"
+    
+    # Normalize: remove trailing slashes except for root
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+        if not path:
+            path = "/"
 
     if not path.startswith("/"):
         path = f"/{path}"

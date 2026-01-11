@@ -6,46 +6,15 @@ import numpy as np
 
 
 # ==========================================
-# 2. MULTIPLICITY PREDICTOR
-# ==========================================
-class MultiplicityPredictor(nn.Module):
-    """Predicts event multiplicity from event-level conditions.
-    
-    Args:
-        cond_dim: Dimension of event conditions (default: 4)
-        
-    Returns in forward():
-        Tensor of shape [batch_size, 1] containing log10(multiplicity) predictions
-    """
-    def __init__(self, cond_dim=4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cond_dim, 64), nn.ELU(),
-            nn.Linear(64, 128),      nn.ELU(),
-            nn.Linear(128, 64),      nn.ELU(),
-            nn.Linear(64, 1)         # Output: log10(N)
-        )
-    
-    def forward(self, cond):
-        """Predict log10 of muon multiplicity.
-        
-        Args:
-            cond: Event conditions [batch_size, cond_dim]
-            
-        Returns:
-            Predicted log10(multiplicity) [batch_size, 1]
-        """
-        return self.net(cond)
-
-# ==========================================
-# 3. SCALABLE GENERATOR (Flat Output)
+# 1. SCALABLE GENERATOR (Flat Output)
 # ==========================================
 class ScalableGenerator(nn.Module):
     """Generative model that produces muons in a flattened representation.
     
-    Uses a two-stage architecture:
-    1. Global network: Processes event-level context from conditions + noise
-    2. Local network: Generates individual muon features from global context + local noise
+    Uses a three-stage architecture:
+    1. Multiplicity network: Predicts muon counts from event conditions
+    2. Global network: Processes event-level context from conditions + noise + predicted multiplicity
+    3. Local network: Generates individual muon features from global context + local noise
     
     The "flat" representation concatenates all muons from a batch into a single tensor
     to enable efficient processing with PyTorch's scatter operations.
@@ -63,10 +32,18 @@ class ScalableGenerator(nn.Module):
         self.hidden_dim = hidden_dim
         self.device = device
         
+        # Multiplicity Predictor: Predicts log10(N) from conditions
+        self.multiplicity_net = nn.Sequential(
+            nn.Linear(self.cond_dim, 64), nn.ELU(),
+            nn.Linear(64, 128),           nn.ELU(),
+            nn.Linear(128, 64),           nn.ELU(),
+            nn.Linear(64, 1)              # Output: log10(N)
+        )
+        
         # Global Context Network: Aggregates event-level information
-        # Input: [global_noise, conditions, normalized_multiplicity]
+        # Input: [global_noise, conditions, predicted_multiplicity]
         self.global_net = nn.Sequential(
-            nn.Linear(self.latent_dim_global + self.cond_dim + 1, 128),  # +1 for scaled multiplicity
+            nn.Linear(self.latent_dim_global + self.cond_dim + 1, 128),  # +1 for predicted multiplicity
             nn.LayerNorm(128), nn.LeakyReLU(0.2),
             nn.Linear(128, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim), nn.LeakyReLU(0.2),
@@ -82,12 +59,11 @@ class ScalableGenerator(nn.Module):
             nn.Linear(64, self.feature_dim)
         )
 
-    def forward(self, conditions, N_target_list):
+    def forward(self, conditions):
         """Generate muons for a batch of events.
         
         Args:
             conditions: Event conditions [batch_size, cond_dim]
-            N_target_list: List of muon counts per event [N1, N2, ..., N_batch]
             
         Returns:
             flat_muons: All generated muons [total_muons, feature_dim]
@@ -95,60 +71,46 @@ class ScalableGenerator(nn.Module):
         """
         batch_size = conditions.size(0)
 
-        # Accept either a Python list of ints or a tensor of counts.
-        if isinstance(N_target_list, torch.Tensor):
-            counts_list = [int(x) for x in N_target_list.detach().tolist()]
-        else:
-            counts_list = [int(x) for x in N_target_list]
+        # 1. Predict multiplicity from conditions
+        multiplicity_log10 = self.multiplicity_net(conditions)  # [batch_size, 1]
+        # Sanitize to avoid NaNs/Infs propagating
+        mul_log10_clean = torch.nan_to_num(multiplicity_log10, nan=0.0, posinf=0.0, neginf=0.0)
+        # Convert log10(N+1) -> counts and keep on device (no CPU sync)
+        counts = torch.pow(10.0, mul_log10_clean.squeeze(1)) - 1
+        counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        counts = counts.clamp_min(0).round().long()  # [batch_size]
 
-        if any(n < 0 for n in counts_list):
-            raise ValueError("Muon counts must be non-negative")
-
-        total_muons = int(sum(counts_list))
+        # No host sync here; handle zero-muon batches naturally via empty tensors downstream.
         
-        # Validate inputs
-        assert batch_size == len(counts_list), "Batch size mismatch with N_target_list"
-
-        # If the whole batch has zero muons, return empty tensors.
-        if total_muons == 0:
-            empty_muons = torch.empty((0, self.feature_dim), device=self.device)
-            empty_idx = torch.empty((0,), dtype=torch.long, device=self.device)
-            return empty_muons, empty_idx
-        
-        # 1. Generate Global Context per Event
-        global_noise = torch.randn(batch_size, self.latent_dim_global).to(self.device)
-        # Normalize multiplicity using log10 to match other log-transformed features (energy, area)
-        # +1 avoids log(0) for edge cases
-        # To convert back: round(10^network_output) gives integer multiplicity
-        multiplicity_normalized = torch.log10(
-            torch.tensor(counts_list, device=self.device).unsqueeze(1).float() + 1
-        )
+        # 2. Generate Global Context per Event
+        global_noise = torch.randn(batch_size, self.latent_dim_global, device=self.device)
+        # Use the predicted multiplicity (log10 normalized) in the global context
+        multiplicity_normalized = mul_log10_clean
         
         global_input = torch.cat([global_noise, conditions, multiplicity_normalized], dim=1)
         event_context = self.global_net(global_input)  # [batch_size, HIDDEN_DIM]
         
-        # 2. Expand Event Context to Match Individual Muons
+        # 3. Expand Event Context to Match Individual Muons
         # Example: If batch has [2, 3] muons, repeat event 0 twice and event 1 three times
-        repeats = torch.tensor(counts_list, device=self.device)
+        repeats = counts  # [batch_size]
         flat_context = torch.repeat_interleave(event_context, repeats, dim=0)  # [total_muons, HIDDEN_DIM]
         
-        # 3. Generate Independent Noise for Each Muon
-        local_noise = torch.randn(total_muons, self.latent_dim_local).to(self.device)
+        # 4. Generate Independent Noise for Each Muon
+        # Generate per-muon noise directly on device without host sync
+        local_noise = torch.empty((flat_context.size(0), self.latent_dim_local), device=self.device).normal_()
         
-        # 4. Generate Muon Features
+        # 5. Generate Muon Features
         local_input = torch.cat([flat_context, local_noise], dim=1)
         flat_muons = self.local_net(local_input)  # [total_muons, feature_dim]
         
-        # 5. Create Batch Index for Scatter Operations
+        # 6. Create Batch Index for Scatter Operations
         # Maps each muon back to its event: e.g., [0, 0, 1, 1, 1] for [2, 3] muons per event
-        batch_index = torch.repeat_interleave(
-            torch.arange(batch_size, device=self.device), repeats
-        )
+        batch_index = torch.repeat_interleave(torch.arange(batch_size, device=self.device), repeats)
         
         return flat_muons, batch_index
 
 # ==========================================
-# 4. SCALABLE CRITIC (Scatter Reduce)
+# 2. SCALABLE CRITIC (Scatter Reduce)
 # ==========================================
 class ScalableCritic(nn.Module):
     """Discriminator that evaluates realism of event-level muon distributions.
@@ -158,12 +120,13 @@ class ScalableCritic(nn.Module):
     2. Max pooling: Aggregates muon scores within each event (captures outliers)
     3. Decision network: Final event-level classification
     """
-    def __init__(self, feat_dim=3, cond_dim=4, device="cpu"):
+    def __init__(self, feat_dim=3, cond_dim=4, device="cpu", pooling_mode: str = "amax"):
         super().__init__()
         
         self.feat_dim = feat_dim
         self.cond_dim = cond_dim
         self.device = device
+        self.pooling_mode = str(pooling_mode or "amax").lower()
 
         # Per-Muon Feature Processor: Conditioned on event context
         self.point_net = nn.Sequential(
@@ -199,23 +162,45 @@ class ScalableCritic(nn.Module):
         # 2. Evaluate Each Muon in Event Context
         point_input = torch.cat([flat_muons, flat_cond], dim=1)
         point_feats = self.point_net(point_input)  # [total_muons, 128]
+        # Sanitize to prevent NaNs/Infs from propagating through amax pooling
+        point_feats = torch.nan_to_num(point_feats, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # 3. Aggregate Muon Scores via Max Pooling
-        # Max pooling captures outliers and unusual muons that violate physics
-        # (Requires PyTorch 1.12+; see torch_scatter.scatter_max for older versions)
-        global_feats = torch.full((batch_size, 128), -1e9, device=self.device)
-        global_feats.scatter_reduce_(
-            0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="amax"
-        )
+        # 3. Aggregate Muon Scores via Pooling
+        if self.pooling_mode == "amax":
+            global_feats = torch.full((batch_size, 128), -1e9, device=self.device)
+            global_feats.scatter_reduce_(
+                0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="amax"
+            )
+        elif self.pooling_mode == "mean":
+            global_feats = torch.zeros((batch_size, 128), device=self.device)
+            global_feats.scatter_reduce_(
+                0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="mean"
+            )
+        else:
+            # Fallback to amax if an unknown mode is provided
+            global_feats = torch.full((batch_size, 128), -1e9, device=self.device)
+            global_feats.scatter_reduce_(
+                0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="amax"
+            )
+        # Ensure finite values post pooling (events without muons remain at -1e9)
+        global_feats = torch.nan_to_num(global_feats, nan=-1e9, posinf=1e9, neginf=-1e9)
         
         # 4. Final Event-Level Scoring
         decision_input = torch.cat([global_feats, conditions], dim=1)
         score = self.decision_net(decision_input)
         
+        # Normalize score by batch size to keep Wasserstein loss in reasonable range
+        # This prevents gradient explosion when batch_size is large
+        score = score / max(1.0, float(batch_size) ** 0.5)
+        
+        # Clamp to prevent unbounded growth of critic weights
+        # Wasserstein distance should be in [-1000, 1000] range for stable training
+        score = torch.clamp(score, min=-1000.0, max=1000.0)
+        
         return score
 
 # ==========================================
-# 5. SCALABLE GRADIENT PENALTY
+# 3. SCALABLE GRADIENT PENALTY
 # ==========================================
 def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch_size, device="cpu"):
     """Compute Wasserstein gradient penalty for discriminator.
@@ -234,8 +219,12 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
         device: Device to run computations on
         
     Returns:
-        Scalar gradient penalty loss
+        Scalar gradient penalty loss (0 if no fake samples)
     """
+    # Handle case where generator produces no samples (early in training)
+    if fake_flat.numel() == 0:
+        return torch.tensor(0.0, device=device)
+    
     # Sample random interpolation weights per event
     alpha = torch.rand(batch_size, 1, device=device)
     alpha_expanded = alpha[batch_index]  # Broadcast to muon level
@@ -261,12 +250,14 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
     # Penalize per-muon gradient norms (more stable than event aggregation)
     # This encourages locally linear critic around data manifold
     grad_norms = gradients.norm(2, dim=1)  # [total_muons]
+    # Replace non-finite gradient norms and softly clamp to curb explosions
+    grad_norms = torch.nan_to_num(grad_norms, nan=0.0, posinf=10.0, neginf=0.0).clamp_max(10.0)
     gradient_penalty = ((grad_norms - 1) ** 2).mean()
     
     return gradient_penalty
 
 # ==========================================
-# 6. TRAINING LOOP DEMO
+# 4. TRAINING LOOP
 # ==========================================
 # Initialize models and optimizers
 # Moved to if __name__ == "__main__": block at the end of file to avoid global variables
@@ -280,58 +271,163 @@ def train_step_scalable(
     real_muons_flat,
     real_batch_idx,
     real_cond,
-    N_list,
+    real_counts,
     lambda_gp=10,
     critic_steps: int = 1,
+    gp_max_pairs: int = 0,
+    gp_sample_fraction: float = 0.0,
+    gp_every: int = 1,
+    grad_clip_norm: float = 0.0,
     device="cpu",
 ):
     """Single training step for Wasserstein GAN with gradient penalty.
     
+    Trains three networks:
+    1. Multiplicity predictor (gen.multiplicity_net): to predict true counts from conditions
+    2. Critic: to distinguish real from generated muons
+    3. Generator: to fool the critic
+    
     Args:
-        gen: Generator model
+        gen: Generator model (includes multiplicity_net)
         crit: Critic model
         opt_G: Generator optimizer
         opt_C: Critic optimizer
         real_muons_flat: Real muon samples [total_muons, feature_dim]
         real_batch_idx: Batch index for real muons [total_muons]
         real_cond: Event conditions [batch_size, cond_dim]
-        N_list: Muon counts per event [batch_size]
+        real_counts: True muon counts per event [batch_size]
         lambda_gp: Gradient penalty weight
+        critic_steps: Number of critic updates per generator update
         device: Device to run computations on
         
     Returns:
-        Tuple of (critic_loss, generator_loss) as scalars
+        Tuple of (critic_loss, generator_loss, multiplicity_loss, w_gap) as scalars
     """
     batch_size = real_cond.size(0)
     
     critic_steps = int(max(1, critic_steps))
     loss_critic = None
+    loss_multiplicity = None
+    w_gap_val = 0.0
+
+    # ===== Train Multiplicity Predictor =====
+    # Target: log10(real_counts + 1) to match network's output
+    if isinstance(real_counts, torch.Tensor):
+        real_counts_tensor = real_counts.float().to(device).unsqueeze(1) if real_counts.dim() == 1 else real_counts.to(device)
+    else:
+        real_counts_tensor = torch.tensor(real_counts, device=device, dtype=torch.float32).unsqueeze(1)
+    target_multiplicity = torch.log10(real_counts_tensor + 1)
+    
+    opt_G.zero_grad()
+    pred_multiplicity = gen.multiplicity_net(real_cond)
+    loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
+    loss_multiplicity.backward()
+    if float(grad_clip_norm) > 0.0:
+        torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
+    opt_G.step()
 
     # ===== Update Critic =====
-    for _ in range(critic_steps):
+    for ci in range(int(critic_steps)):
         opt_C.zero_grad()
 
-        # Generate fake samples
-        fake_muons_flat, fake_batch_idx = gen(real_cond, N_list)
+        # Generate fake samples (generator predicts its own multiplicity)
+        fake_muons_flat, fake_batch_idx = gen(real_cond)
 
         # Score real and fake samples (detach fakes to prevent generator gradient flow)
         real_score = crit(real_muons_flat, real_batch_idx, real_cond, batch_size)
         fake_score = crit(fake_muons_flat.detach(), fake_batch_idx, real_cond, batch_size)
+        try:
+            w_gap_val = float((real_score.mean() - fake_score.mean()).item())
+        except Exception:
+            w_gap_val = 0.0
 
-        # Compute Wasserstein loss and gradient penalty
+        # Build per-event aligned subsets for gradient penalty efficiently
+        # Pair up min(count_real, count_fake) muons per event using sorted indices
+        apply_gp = (lambda_gp > 0) and (int(gp_every) > 0) and ((ci % int(gp_every)) == 0)
+        with torch.no_grad():
+            if apply_gp:
+                # Counts per event
+                real_counts_ev = torch.bincount(real_batch_idx, minlength=batch_size)
+                fake_counts_ev = torch.bincount(fake_batch_idx, minlength=batch_size)
+                k_ev = torch.minimum(real_counts_ev, fake_counts_ev)
+
+                # Sort indices by event once (avoids repeated nonzero scans)
+                real_sorted_order = torch.argsort(real_batch_idx)
+                fake_sorted_order = torch.argsort(fake_batch_idx)
+                real_sorted_idx = real_sorted_order
+                fake_sorted_idx = fake_sorted_order
+
+                # Offsets per event into the sorted index arrays
+                real_offsets = torch.zeros(batch_size, dtype=torch.long, device=device)
+                fake_offsets = torch.zeros(batch_size, dtype=torch.long, device=device)
+                if batch_size > 1:
+                    real_offsets[1:] = torch.cumsum(real_counts_ev[:-1], dim=0)
+                    fake_offsets[1:] = torch.cumsum(fake_counts_ev[:-1], dim=0)
+
+                # Collect aligned slices
+                idx_real_list = []
+                idx_fake_list = []
+                batch_sub_list = []
+                nonzero_events = (k_ev > 0).nonzero(as_tuple=False).squeeze(1)
+                # Batch transfer to CPU before loop to avoid repeated GPU syncs
+                k_ev_cpu = k_ev.cpu()
+                real_offsets_cpu = real_offsets.cpu()
+                fake_offsets_cpu = fake_offsets.cpu()
+                for e in nonzero_events.tolist():
+                    k = int(k_ev_cpu[e].item())
+                    r_start = int(real_offsets_cpu[e].item())
+                    f_start = int(fake_offsets_cpu[e].item())
+                    idx_real_list.append(real_sorted_idx[r_start:r_start + k])
+                    idx_fake_list.append(fake_sorted_idx[f_start:f_start + k])
+                    batch_sub_list.append(torch.full((k,), e, dtype=torch.long, device=device))
+
+                if idx_real_list:
+                    idx_r = torch.cat(idx_real_list)
+                    idx_f = torch.cat(idx_fake_list)
+                    batch_idx_sub = torch.cat(batch_sub_list)
+                    # Optional subsampling to limit GP cost
+                    n_pairs = int(idx_r.numel())
+                    target_n = n_pairs
+                    if int(gp_max_pairs) > 0:
+                        target_n = min(target_n, int(gp_max_pairs))
+                    if float(gp_sample_fraction) > 0.0 and float(gp_sample_fraction) < 1.0:
+                        frac_n = max(1, int(n_pairs * float(gp_sample_fraction)))
+                        target_n = min(target_n, frac_n)
+                    if target_n < n_pairs:
+                        perm = torch.randperm(n_pairs, device=device)[:target_n]
+                        idx_r = idx_r[perm]
+                        idx_f = idx_f[perm]
+                        batch_idx_sub = batch_idx_sub[perm]
+
+                    real_sub = real_muons_flat[idx_r]
+                    fake_sub = fake_muons_flat.detach()[idx_f]
+                else:
+                    # No pairs available; skip penalty
+                    real_sub = torch.empty((0, real_muons_flat.shape[1]), device=device)
+                    fake_sub = torch.empty((0, real_muons_flat.shape[1]), device=device)
+                    batch_idx_sub = torch.empty((0,), dtype=torch.long, device=device)
+            else:
+                # GP not applied on this critic step
+                real_sub = torch.empty((0, real_muons_flat.shape[1]), device=device)
+                fake_sub = torch.empty((0, real_muons_flat.shape[1]), device=device)
+                batch_idx_sub = torch.empty((0,), dtype=torch.long, device=device)
+
+        # Compute Wasserstein loss and gradient penalty on aligned subsets
         gradient_penalty = compute_gp_flat(
             crit,
-            real_muons_flat,
-            fake_muons_flat.detach(),
-            real_batch_idx,
+            real_sub,
+            fake_sub,
+            batch_idx_sub,
             real_cond,
             batch_size,
             device=device,
-        )
+        ) if apply_gp else torch.tensor(0.0, device=device)
 
         # Wasserstein distance: minimize (fake - real)
         loss_critic = fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty
         loss_critic.backward()
+        if float(grad_clip_norm) > 0.0:
+            torch.nn.utils.clip_grad_norm_(crit.parameters(), float(grad_clip_norm))
         opt_C.step()
     
     # ===== Update Generator =====
@@ -342,9 +438,16 @@ def train_step_scalable(
     loss_generator = -fake_score_G.mean()  # Maximize critic score
     
     loss_generator.backward()
+    if float(grad_clip_norm) > 0.0:
+        torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
     opt_G.step()
-    
-    return float(loss_critic.item()) if loss_critic is not None else 0.0, float(loss_generator.item())
+
+    return (
+        float(loss_critic.item()) if loss_critic is not None else 0.0,
+        float(loss_generator.item()),
+        float(loss_multiplicity.item()) if loss_multiplicity is not None else 0.0,
+        float(w_gap_val),
+    )
 
 if __name__ == "__main__":
     # Configuration

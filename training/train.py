@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.optim as optim
 from tqdm import tqdm
+from collections import deque
+import math
 
 from utils import (
     expand_pelican_wildcards,
@@ -446,7 +448,7 @@ def main(args):
     if outliers_dir:
         outlier_writer = OutlierParquetWriter(str(outliers_dir))
         ev_thr = int(getattr(args, "max_muons_per_event", 0) or 0)
-        thr_label = "--max-muons-per-event" if ev_thr > 0 else "--max-muons-per-batch"
+        thr_label = "--max-muons-per-event" if ev_thr > 0 else "c"
         thr_val = ev_thr if ev_thr > 0 else int(getattr(args, "max_muons_per_batch", 0) or 0)
         print(f"Outlier capture enabled: {outliers_dir} (threshold {thr_label}={thr_val})")
 
@@ -457,6 +459,10 @@ def main(args):
         print(f"In-memory parquet cache enabled: {mem_cache_mb} MiB (process-local)")
 
     train_steps_done = 0
+    # Track 500-step moving average of Wasserstein gap
+    w_gap_window = 500
+    w_gap_hist: deque[float] = deque(maxlen=w_gap_window)
+    w_gap_sum = 0.0
     first_batch_printed = False  # Track if we've printed the first batch
     file_pbar = tqdm(files_to_process, desc="Files", unit="file")
     for file_idx, file_path in enumerate(file_pbar, start=1):
@@ -786,7 +792,7 @@ def main(args):
                     )
                     prof.__enter__()
 
-                c_loss_local, g_loss_local, m_loss_local = train_step_scalable(
+                c_loss_local, g_loss_local, m_loss_local, w_gap_local = train_step_scalable(
                     gen,
                     crit,
                     opt_G,
@@ -814,11 +820,12 @@ def main(args):
                         tqdm.write(f"[Profile error: {e}]")
                     steps_profiled += 1
 
-                return c_loss_local, g_loss_local, m_loss_local, sub_muons_norm, sub_prims_norm, sub_counts
+                return c_loss_local, g_loss_local, m_loss_local, w_gap_local, sub_muons_norm, sub_prims_norm, sub_counts
 
             # Default: single step on the full batch.
+            updated_w_ma = False  # Track if w_gap moving average updated in branch
             if max_muons <= 0 or counts_sum_val <= max_muons:
-                c_loss, g_loss, m_loss, real_muons_norm, prims_norm, counts_dev = _run_substep(
+                c_loss, g_loss, m_loss, w_gap, real_muons_norm, prims_norm, counts_dev = _run_substep(
                     real_muons_feats, batch_idx, prims_feats, counts
                 )
                 train_steps_done += 1
@@ -829,6 +836,7 @@ def main(args):
                 last_c = None
                 last_g = None
                 last_m = None
+                last_w = None
                 last_real_norm = None
                 last_prims_norm = None
                 last_counts_dev = None
@@ -875,7 +883,7 @@ def main(args):
                         sub_muons = real_muons_feats[m]
                         sub_bidx = batch_idx[m] - start_ev
                         if sub_muons.numel() > 0:
-                            last_c, last_g, last_m, last_real_norm, last_prims_norm, last_counts_dev = _run_substep(
+                            last_c, last_g, last_m, last_w, last_real_norm, last_prims_norm, last_counts_dev = _run_substep(
                                 sub_muons, sub_bidx, sub_prims, sub_counts
                             )
                             train_steps_done += 1
@@ -891,14 +899,35 @@ def main(args):
                     skipped_empty += 1
                     continue
                 c_loss, g_loss = float(last_c), float(last_g)
+                w_gap = float(last_w) if last_w is not None else 0.0
+                # Update moving average buffer within microbatch path
+                try:
+                    if len(w_gap_hist) == w_gap_window:
+                        w_gap_sum -= float(w_gap_hist[0])
+                    w_gap_hist.append(float(w_gap))
+                    w_gap_sum += float(w_gap)
+                    updated_w_ma = True
+                except Exception:
+                    updated_w_ma = False
                 real_muons_norm = last_real_norm
                 prims_norm = last_prims_norm
                 counts_dev = last_counts_dev
 
+            # If not updated yet (e.g., full-batch path), update moving average now
+            if not updated_w_ma:
+                try:
+                    if len(w_gap_hist) == w_gap_window:
+                        w_gap_sum -= float(w_gap_hist[0])
+                    w_gap_hist.append(float(w_gap))
+                    w_gap_sum += float(w_gap)
+                except Exception:
+                    pass
+            w_gap_ma = (w_gap_sum / max(1, len(w_gap_hist)))
+
             t_step1 = time.perf_counter()
             step_time_s += (t_step1 - t_step0)
 
-            batch_pbar.set_postfix(c_loss=f"{c_loss:.4f}", g_loss=f"{g_loss:.4f}", m_loss=f"{m_loss:.4f}")
+            batch_pbar.set_postfix(c_loss=f"{c_loss:.4f}", g_loss=f"{g_loss:.4f}", m_loss=f"{m_loss:.4f}", w_gap=f"{w_gap:.4f}", w_ma=f"{w_gap_ma:.4f}")
 
             # TensorBoard logging (optional)
             if writer is not None:
@@ -910,6 +939,11 @@ def main(args):
                     writer.add_scalar("train/c_loss", float(c_loss), train_steps_done)
                     writer.add_scalar("train/g_loss", float(g_loss), train_steps_done)
                     writer.add_scalar("train/m_loss", float(m_loss), train_steps_done)
+                    writer.add_scalar("train/w_gap", float(w_gap), train_steps_done)
+                    try:
+                        writer.add_scalar("train/w_gap_ma_500", float(w_gap_ma), train_steps_done)
+                    except Exception:
+                        pass
                     writer.add_scalar("perf/avg_load_ms", float(avg_load_ms), train_steps_done)
                     writer.add_scalar("perf/avg_step_ms", float(avg_step_ms), train_steps_done)
                     writer.add_scalar("perf/batch_per_s", float(batches_seen / elapsed), train_steps_done)
@@ -1034,17 +1068,72 @@ def main(args):
                         f" active={active:.0f}MiB inact_split={inact:.0f}MiB free={free:.0f}MiB"
                         f" usage={usage_pct:.1f}%"
                     )
+                # Loss health check: warn if out of expected ranges or non-finite
+                warnings = []
+                try:
+                    if not math.isfinite(float(c_loss)):
+                        warnings.append("c_loss non-finite")
+                    if not math.isfinite(float(g_loss)):
+                        warnings.append("g_loss non-finite")
+                    if not math.isfinite(float(m_loss)):
+                        warnings.append("m_loss non-finite")
+                except Exception:
+                    warnings.append("loss finite-check failed")
+
+                # Heuristic ranges based on observed stable training
+                # c_loss typically ~ [-300, 0]; g_loss ~ around 1000 due to clamp; m_loss < 0.2
+                try:
+                    if abs(float(c_loss)) > 1000.0:
+                        warnings.append(f"c_loss out-of-range ({float(c_loss):.4f})")
+                    g_val = float(g_loss)
+                    if g_val < 100.0 or g_val > 5000.0:
+                        warnings.append(f"g_loss out-of-range ({g_val:.4f})")
+                    if float(m_loss) > 0.20:
+                        warnings.append(f"m_loss high ({float(m_loss):.4f})")
+                except Exception:
+                    pass
+
+                if warnings:
+                    tqdm.write(
+                        f"[file {file_idx}/{len(files_to_process)}] WARNING: " + "; ".join(warnings)
+                    )
+                    # Log to TensorBoard when loss warnings occur
+                    if writer is not None:
+                        try:
+                            writer.add_scalar("status/loss_warning", 1.0, train_steps_done)
+                            writer.add_text("status/loss_warning_msg", "; ".join(warnings), train_steps_done)
+                        except Exception:
+                            pass
                 tqdm.write(
                     f"[file {file_idx}/{len(files_to_process)}] batches={batches_seen} "
                     f"events={events_seen} muons={muons_seen} "
                     f"skipped_empty={skipped_empty} skipped_oversize={skipped_oversize} written_oversize={written_oversize} "
                     f"rate: {bps:.2f} batch/s {eps:.1f} evt/s {mps:.1f} mu/s "
                     f"avg: load={avg_load_ms:.1f}ms step={avg_step_ms:.1f}ms "
-                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f}"
+                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f} w_gap={w_gap:.4f} w_ma={w_gap_ma:.4f}"
                     f"{mem_s}"
                 )
 
         batch_pbar.close()
+
+        # Explicitly clean up DataLoader and dataset to release file descriptors
+        # This prevents "too many open files" errors when processing many files
+        try:
+            del data_iter
+        except Exception:
+            pass
+        try:
+            del dataloader
+        except Exception:
+            pass
+        try:
+            del dataset
+        except Exception:
+            pass
+        
+        # Force garbage collection to release resources immediately
+        import gc
+        gc.collect()
 
         # Checkpoint after file is done
         processed_files.add(file_path)
