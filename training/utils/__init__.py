@@ -9,7 +9,7 @@ from .checkpoint_io import (
     save_model_checkpoint,
     save_progress,
 )
-from .data_utils import OutlierParquetWriter, PrefetchIterator
+from .data_utils import MultiFileShuffledIterator, OutlierParquetWriter, PrefetchIterator
 from .debug_utils import first_batch_signature, infer_file_format, print_file_contents
 from .device_utils import device_backend_label, select_torch_device
 from .gpu_monitor import GPUUsageTracker, cuda_mem_stats
@@ -28,6 +28,7 @@ from .pelican_utils import (
 )
 
 __all__ = [
+    "MultiFileShuffledIterator",
     "OutlierParquetWriter",
     "PrefetchIterator",
     "PelicanPrefetcher",

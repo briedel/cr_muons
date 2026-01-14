@@ -29,6 +29,7 @@ from utils import (
     is_pelican_path,
     load_model_checkpoint,
     load_progress,
+    MultiFileShuffledIterator,
     OutlierParquetWriter,
     PelicanPrefetcher,
     pelican_uri_to_local_cache_path,
@@ -55,6 +56,11 @@ from model import ScalableGenerator, ScalableCritic, train_step_scalable
 from torch.utils.data import DataLoader
 
 def main(args):
+    # Enable anomaly detection for debugging inplace operation errors
+    if bool(getattr(args, "detect_anomaly", False)):
+        torch.autograd.set_detect_anomaly(True)
+        print("Anomaly detection enabled (will slow down training)")
+    
     # Normalize inputs
     raw_infiles = [str(x) for x in args.infiles]
 
@@ -464,133 +470,606 @@ def main(args):
     w_gap_hist: deque[float] = deque(maxlen=w_gap_window)
     w_gap_sum = 0.0
     first_batch_printed = False  # Track if we've printed the first batch
-    file_pbar = tqdm(files_to_process, desc="Files", unit="file")
-    for file_idx, file_path in enumerate(file_pbar, start=1):
-        file_pbar.set_description(f"Processing {os.path.basename(file_path)}")
 
-        if prefetcher is not None:
-            file_pbar.set_postfix(prefetch=prefetcher.progress_string())
+    # Profiling control for multi-file path
+    profile_steps = int(getattr(args, "profile_steps", 0) or 0)
+    steps_profiled = 0
 
-        # In non-interactive environments, tqdm may not render well. Emit a
-        # clear per-file marker to stdout.
-        tqdm.write(f"[file {file_idx}/{len(files_to_process)}] start source={file_path}")
-
-        read_path = file_path
-        cached_local_path = None
-        if getattr(args, "prefetch_dir", None) and is_pelican_path(file_path):
-            cached = pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir)
-            cached_local_path = cached
-            if prefetcher is not None and file_path in prefetcher.uri_to_index:
-                prefetcher.update_current_uri(file_path)
-                file_pbar.set_postfix(prefetch=prefetcher.progress_string())
-                prefetcher.wait_for(file_path)
-                file_pbar.set_postfix(prefetch=prefetcher.progress_string())
-                read_path = cached
-            elif os.path.exists(cached) and os.path.getsize(cached) > 0:
-                read_path = cached
-
-        if read_path != file_path:
-            tqdm.write(f"[file {file_idx}/{len(files_to_process)}] read_path={read_path} (cached)")
-        else:
-            tqdm.write(f"[file {file_idx}/{len(files_to_process)}] read_path={read_path}")
-
-        # Fail fast with a more actionable message than a deep h5py traceback.
-        if not is_pelican_path(read_path) and not os.path.exists(read_path):
-            raise FileNotFoundError(
-                f"Input file not found: {read_path}\n"
-                "If this is a host filesystem path (e.g. /icecube/...), make sure it is available/mounted in your environment.\n"
-                "If you intended to read via Pelican, pass a pelican:// URI (and optionally --federation-url/--token)."
-            )
-
-        file_format = infer_file_format(read_path)
-
-        fed_for_read = args.federation_url if is_pelican_path(read_path) else None
-        token_for_read = args.token if is_pelican_path(read_path) else None
-
-        # Parquet and pelican:// inputs require the HF streaming loader in this repo.
-        use_hf_for_file = bool(args.use_hf) or file_format == "parquet" or is_pelican_path(read_path)
-        if (not args.use_hf) and use_hf_for_file and (file_format == "parquet" or is_pelican_path(read_path)):
-            print(
-                f"Info: using HF streaming loader for {file_format} input: {read_path} "
-                "(add --use-hf to enable this explicitly)."
-            )
-
-        tqdm.write(
-            f"[file {file_idx}/{len(files_to_process)}] loader={'hf_streaming' if use_hf_for_file else 'hdf5_local'} format={file_format}"
+    # Adaptive tuning state (used when --adaptive-critic is enabled)
+    critic_steps_cur = int(getattr(args, "critic_steps", 1) or 1)
+    lambda_gp_cur = float(getattr(args, "lambda_gp", 0.0) or 0.0)
+    
+    # Multi-file shuffling mode: process N files concurrently with round-robin batching
+    multi_file_n = int(getattr(args, "multi_file_shuffle", 0) or 0)
+    if multi_file_n > 0:
+        print(f"Multi-file shuffling enabled: {multi_file_n} concurrent files")
+        
+        def create_file_loader(file_path):
+            """Factory function to create a DataLoader for a single file."""
+            # Determine read path (with prefetching support)
+            read_path = file_path
+            cached_local_path = None
+            if getattr(args, "prefetch_dir", None) and is_pelican_path(file_path):
+                cached = pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir)
+                cached_local_path = cached
+                if prefetcher is not None and file_path in prefetcher.uri_to_index:
+                    prefetcher.update_current_uri(file_path)
+                    prefetcher.wait_for(file_path)
+                    read_path = cached
+                elif os.path.exists(cached) and os.path.getsize(cached) > 0:
+                    read_path = cached
+            
+            if not is_pelican_path(read_path) and not os.path.exists(read_path):
+                raise FileNotFoundError(f"Input file not found: {read_path}")
+            
+            file_format = infer_file_format(read_path)
+            fed_for_read = args.federation_url if is_pelican_path(read_path) else None
+            token_for_read = args.token if is_pelican_path(read_path) else None
+            use_hf_for_file = bool(args.use_hf) or file_format == "parquet" or is_pelican_path(read_path)
+            
+            if use_hf_for_file:
+                if file_format == "parquet" and bool(getattr(args, "parquet_batch_reader", False)):
+                    dataset = get_parquet_batch_dataset(
+                        [read_path],
+                        batch_size=args.batch_size,
+                        federation_url=fed_for_read,
+                        token=token_for_read,
+                        memory_cache=memory_cache,
+                        shuffle=bool(getattr(args, "shuffle", False)),
+                        shuffle_seed=int(getattr(args, "shuffle_seed", 42)),
+                    )
+                    collate = None
+                else:
+                    dataset = get_hf_dataset(
+                        [read_path],
+                        file_format=file_format,
+                        streaming=True,
+                        federation_url=fed_for_read,
+                        token=token_for_read,
+                        memory_cache=memory_cache,
+                    )
+                    collate = hf_collate_fn
+            else:
+                dataset = SingleHDF5Dataset(read_path)
+                collate = ragged_collate_fn
+            
+            num_workers = int(getattr(args, "num_workers", 0) or 0)
+            if (not use_hf_for_file) and num_workers > 0:
+                num_workers = 0
+            if collate is not None and num_workers > 0:
+                num_workers = 0
+            
+            dl_kwargs = {
+                "num_workers": num_workers,
+                "pin_memory": bool(getattr(args, "pin_memory", False)),
+            }
+            if num_workers > 0:
+                dl_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2) or 2)
+                dl_kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
+            
+            if collate is None:
+                dataloader = DataLoader(dataset, batch_size=None, **dl_kwargs)
+            else:
+                dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate, **dl_kwargs)
+            
+            batch_prefetch = int(getattr(args, "prefetch_batches", 0) or 0)
+            if batch_prefetch > 0:
+                data_iter = PrefetchIterator(iter(dataloader), max_prefetch=batch_prefetch)
+            else:
+                data_iter = iter(dataloader)
+            
+            return data_iter
+        
+        # Create multi-file iterator
+        multi_iter = MultiFileShuffledIterator(
+            file_queue=files_to_process,
+            loader_factory=create_file_loader,
+            num_concurrent=multi_file_n,
         )
         
-        if use_hf_for_file:
-            # Fast-path for parquet: yield already-batched tensors directly from Arrow
-            # record batches to reduce Python/HF collation overhead.
-            if file_format == "parquet" and bool(getattr(args, "parquet_batch_reader", False)):
-                dataset = get_parquet_batch_dataset(
-                    [read_path],
-                    batch_size=args.batch_size,
-                    federation_url=fed_for_read,
-                    token=token_for_read,
-                    memory_cache=memory_cache,
-                )
-                collate = None
-            else:
-                dataset = get_hf_dataset(
-                    [read_path],
-                    file_format=file_format,
-                    streaming=True,
-                    federation_url=fed_for_read,
-                    token=token_for_read,
-                    memory_cache=memory_cache,
-                )
-                collate = hf_collate_fn
-        else:
-            # Local HDF5 fast-path.
-            dataset = SingleHDF5Dataset(read_path)
-            collate = ragged_collate_fn
-
-        num_workers = int(getattr(args, "num_workers", 0) or 0)
-        if (not use_hf_for_file) and num_workers > 0:
-            print(
-                "Warning: --num-workers>0 is not supported for local HDF5 fast-path; forcing --num-workers=0 for this file."
-            )
-            num_workers = 0
-
-        if collate is not None and num_workers > 0:
-            print(
-                "Warning: --num-workers>0 is currently only supported with --parquet-batch-reader (already-batched dataset). "
-                "Forcing --num-workers=0 for this file."
-            )
-            num_workers = 0
-
-        dl_kwargs = {
-            "num_workers": num_workers,
-            "pin_memory": bool(getattr(args, "pin_memory", False)),
-        }
-        if num_workers > 0:
-            dl_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2) or 2)
-            dl_kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
-
-        if collate is None:
-            # Dataset already yields fully-formed batches.
-            dataloader = DataLoader(dataset, batch_size=None, **dl_kwargs)
-        else:
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                collate_fn=collate,
-                **dl_kwargs,
-            )
-
-        # For streaming datasets, measuring how long we spend waiting for the
-        # next batch (I/O + decode + collate) vs training compute is useful.
-        data_iter = iter(dataloader)
-        batch_prefetch = int(getattr(args, "prefetch_batches", 0) or 0)
-        if batch_prefetch > 0:
-            data_iter = PrefetchIterator(data_iter, max_prefetch=batch_prefetch)
         batch_pbar = tqdm(desc="Batches", unit="batch", leave=False)
-        batches_seen = 0
-        events_seen = 0
-        muons_seen = 0
-        skipped_empty = 0
-        reported_first_batch = False
+        batches_seen_global = 0
+        events_seen_global = 0
+        muons_seen_global = 0
+        
+        # Track per-file stats for final reporting
+        file_stats = {}  # file_path -> {batches, events, muons, skipped_empty, etc}
+        
+        for batch_data, file_info in multi_iter:
+            if batch_data is None and file_info.get('exhausted'):
+                # File exhausted - save checkpoint and cleanup
+                file_path = file_info['file_path']
+                file_idx = file_info['file_idx']
+                batches_from_file = file_info['batches_from_file']
+                
+                if file_path in file_stats:
+                    stats = file_stats[file_path]
+                    tqdm.write(
+                        f"[file {file_idx}/{len(files_to_process)}] done batches={stats['batches']} "
+                        f"events={stats['events']} muons={stats['muons']} "
+                        f"skipped_empty={stats['skipped_empty']}"
+                    )
+                
+                # Save checkpoint
+                processed_files.add(file_path)
+                save_progress(args.checkpoint, progress_epoch, processed_files, fs=checkpoint_fs)
+                save_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, fs=model_checkpoint_fs)
+                
+                # Delete cache if needed
+                if bool(getattr(args, "prefetch_delete_after_use", False)):
+                    cached_path = pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir) if is_pelican_path(file_path) else None
+                    if cached_path and os.path.exists(cached_path):
+                        try:
+                            os.remove(cached_path)
+                            tqdm.write(f"[file {file_idx}/{len(files_to_process)}] deleted cache={cached_path}")
+                        except Exception as e:
+                            tqdm.write(f"[file {file_idx}/{len(files_to_process)}] warning: could not delete cache: {e}")
+                
+                continue
+            
+            # Process batch
+            file_path = file_info['file_path']
+            file_idx = file_info['file_idx']
+            
+            # Initialize stats for this file if needed
+            if file_path not in file_stats:
+                file_stats[file_path] = {
+                    'batches': 0,
+                    'events': 0,
+                    'muons': 0,
+                    'skipped_empty': 0,
+                }
+            
+            real_muons, batch_idx, prims, counts = batch_data
+
+            # Enable non_blocking transfers when pinned memory is used on CUDA devices
+            non_blocking = bool(getattr(args, "pin_memory", False)) and str(device).startswith("cuda")
+            
+            # Update batch progress bar to show which files are active
+            batch_pbar.set_postfix(active_files=file_info['active_files'])
+            batch_pbar.update(1)
+            
+            batches_seen_global += 1
+            file_stats[file_path]['batches'] += 1
+            
+            counts_cpu = counts.detach().cpu()
+            counts_sum_val = int(counts_cpu.sum().item())
+            counts_numel_val = int(counts.numel())
+            
+            # Drop zero-muon events (unbatched). Also remap batch_idx to new event indices.
+            if bool(getattr(args, "drop_empty_events", False)):
+                keep_mask = counts_cpu > 0
+                dropped = counts_numel_val - int(keep_mask.sum().item())
+                if dropped > 0:
+                    file_stats[file_path]["skipped_empty"] += dropped
+                    # Filter events and primaries
+                    counts = counts[keep_mask]
+                    prims = prims[keep_mask]
+                    counts_cpu = counts_cpu[keep_mask]
+                    counts_sum_val = int(counts_cpu.sum().item())
+                    counts_numel_val = int(counts.numel())
+                    
+                    # Remap batch_idx and filter muons to kept events only
+                    if batch_idx.numel() > 0:
+                        # Create mapping: old event index -> new event index
+                        old_to_new = torch.full((counts_numel_val + dropped,), -1, dtype=torch.long)
+                        old_to_new[keep_mask] = torch.arange(counts_numel_val, dtype=torch.long)
+                        # Keep muons that belong to kept events
+                        muons_keep = old_to_new[batch_idx] >= 0
+                        real_muons = real_muons[muons_keep]
+                        batch_idx = old_to_new[batch_idx[muons_keep]]
+                if counts_numel_val == 0 or counts_sum_val == 0:
+                    continue
+
+            events_seen_global += counts_numel_val
+            muons_seen_global += counts_sum_val
+            file_stats[file_path]['events'] += counts_numel_val
+            file_stats[file_path]['muons'] += counts_sum_val
+            
+            # Skip empty batches
+            if counts_sum_val == 0:
+                file_stats[file_path]['skipped_empty'] += 1
+                continue
+            
+            # Prepare data tensors (keeping existing logic for compatibility)
+            prims_raw = prims
+            real_muons_raw = real_muons
+            if prims.shape[1] == 6:
+                prims_feats = prims[:, 2:]
+            else:
+                prims_feats = prims
+            
+            if real_muons.shape[1] == 5:
+                real_muons_feats = real_muons[:, 2:]
+            else:
+                real_muons_feats = real_muons
+            
+            # Training substep function (reused from original code)
+            def _run_substep(
+                sub_muons_feats: torch.Tensor,
+                sub_batch_idx: torch.Tensor,
+                sub_prims_feats: torch.Tensor,
+                sub_counts: torch.Tensor,
+            ):
+                nonlocal first_batch_printed, steps_profiled
+                
+                sub_muons_feats = sub_muons_feats.to(device, non_blocking=non_blocking)
+                sub_batch_idx = sub_batch_idx.to(device, non_blocking=non_blocking)
+                sub_prims_feats = sub_prims_feats.to(device, non_blocking=non_blocking)
+                sub_counts = sub_counts.to(device, non_blocking=non_blocking)
+                
+                sub_muons_norm = normalizer.normalize_features(sub_muons_feats)
+                sub_prims_norm = normalizer.normalize_primaries(sub_prims_feats)
+                
+                # Print first batch sample
+                if (not first_batch_printed) and (sub_muons_feats.numel() > 0):
+                    first_batch_printed = True
+                    n_show = min(10, int(sub_muons_feats.shape[0]))
+                    tqdm.write("\n" + "="*80)
+                    tqdm.write("[First Training Batch Sample Inspector]")
+                    tqdm.write("="*80)
+                    tqdm.write(f"\n--- Muon Features (first {n_show} samples) ---")
+                    tqdm.write("Unnormalized:")
+                    for i in range(n_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_muons_feats[i].cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("\nNormalized:")
+                    for i in range(n_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_muons_norm[i].detach().cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    n_prims_show = min(10, int(sub_prims_feats.shape[0]))
+                    tqdm.write(f"\n--- Primary Features (first {n_prims_show} events) ---")
+                    tqdm.write("Unnormalized:")
+                    for i in range(n_prims_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_prims_feats[i].cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("\nNormalized:")
+                    for i in range(n_prims_show):
+                        vals_str = "  ".join([f"{v:.6f}" for v in sub_prims_norm[i].detach().cpu().numpy()])
+                        tqdm.write(f"  [{i}] {vals_str}")
+                    tqdm.write("="*80 + "\n")
+                
+                # Optional per-batch profiler
+                should_profile = (profile_steps > 0 and steps_profiled < profile_steps)
+                prof = None
+                if should_profile:
+                    prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        record_shapes=True,
+                    )
+                    prof.__enter__()
+
+                c_loss_local, g_loss_local, m_loss_local, w_gap_local = train_step_scalable(
+                    gen,
+                    crit,
+                    opt_G,
+                    opt_C,
+                    sub_muons_norm,
+                    sub_batch_idx,
+                    sub_prims_norm,
+                    sub_counts,
+                    lambda_gp=lambda_gp_cur,
+                    critic_steps=int(critic_steps_cur),
+                    gp_max_pairs=int(getattr(args, "gp_max_pairs", 0) or 0),
+                    gp_sample_fraction=float(getattr(args, "gp_sample_fraction", 0.0) or 0.0),
+                    gp_every=int(getattr(args, "gp_every", 1) or 1),
+                    grad_clip_norm=float(getattr(args, "grad_clip_norm", 0.0) or 0.0),
+                    device=device,
+                )
+
+                if should_profile and prof is not None:
+                    prof.__exit__(None, None, None)
+                    try:
+                        tqdm.write(f"[profile mf step {steps_profiled+1}/{profile_steps}]")
+                        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15)
+                        tqdm.write(table)
+                    except Exception as e:
+                        tqdm.write(f"[profile mf error: {e}]")
+                    steps_profiled += 1
+                
+                return c_loss_local, g_loss_local, m_loss_local, w_gap_local
+            
+            # Run training step
+            max_muons = int(getattr(args, "max_muons_per_batch", 0) or 0)
+            if max_muons <= 0 or counts_sum_val <= max_muons:
+                c_loss, g_loss, m_loss, w_gap = _run_substep(
+                    real_muons_feats, batch_idx, prims_feats, counts
+                )
+                train_steps_done += 1
+            else:
+                # Microbatch by contiguous event ranges so batch_idx slicing is cheap.
+                bsz = counts_numel_val
+                start_ev = 0
+                last_c = None
+                last_g = None
+                last_m = None
+                last_w = None
+
+                # Derive per-event oversize limit
+                max_event_muons = int(getattr(args, "max_muons_per_event", 0) or 0)
+                event_muon_limit = max_event_muons if max_event_muons > 0 else max_muons
+
+                counts_cpu_list = counts_cpu.tolist()
+                while start_ev < bsz:
+                    # Optionally advance past zero-muon events to start a positive range
+                    if bool(getattr(args, "drop_empty_events", False)):
+                        while start_ev < bsz and int(counts_cpu_list[start_ev]) == 0:
+                            file_stats[file_path]['skipped_empty'] += 1
+                            start_ev += 1
+                        if start_ev >= bsz:
+                            break
+                    cum = 0
+                    end_ev = start_ev
+                    while end_ev < bsz:
+                        c = counts_cpu_list[end_ev]
+                        # If dropping empty events, stop the contiguous range at the first zero
+                        if bool(getattr(args, "drop_empty_events", False)) and int(c) == 0:
+                            break
+                        # If a single event exceeds the limit, skip it safely
+                        if event_muon_limit > 0 and end_ev == start_ev and c > event_muon_limit:
+                            end_ev = start_ev + 1
+                            cum = 0
+                            break
+                        if (end_ev > start_ev) and (cum + c > max_muons):
+                            break
+                        cum += c
+                        end_ev += 1
+                        if cum >= max_muons:
+                            break
+                    if end_ev <= start_ev:
+                        end_ev = start_ev + 1
+
+                    sub_counts = counts[start_ev:end_ev]
+                    sub_counts_cpu = counts_cpu[start_ev:end_ev]
+                    sub_counts_sum = int(sub_counts_cpu.sum().item())
+                    if sub_counts_sum > 0:
+                        sub_prims = prims_feats[start_ev:end_ev]
+                        m = (batch_idx >= start_ev) & (batch_idx < end_ev)
+                        sub_muons = real_muons_feats[m]
+                        sub_bidx = batch_idx[m] - start_ev
+                        if sub_muons.numel() > 0:
+                            last_c, last_g, last_m, last_w = _run_substep(
+                                sub_muons, sub_bidx, sub_prims, sub_counts
+                            )
+                            train_steps_done += 1
+                        else:
+                            file_stats[file_path]['skipped_empty'] += 1
+                    else:
+                        file_stats[file_path]['skipped_empty'] += 1
+
+                    start_ev = end_ev
+
+                # If no microbatch produced a step, skip
+                if last_c is None or last_g is None or last_w is None:
+                    file_stats[file_path]['skipped_empty'] += 1
+                    continue
+
+                c_loss, g_loss, m_loss, w_gap = float(last_c), float(last_g), float(last_m), float(last_w)
+            
+            # Update Wasserstein gap moving average
+            if len(w_gap_hist) == w_gap_window:
+                oldest = w_gap_hist[0]
+                w_gap_sum -= oldest
+            w_gap_hist.append(w_gap)
+            w_gap_sum += w_gap
+            w_gap_ma = w_gap_sum / len(w_gap_hist) if len(w_gap_hist) > 0 else 0.0
+            
+            # Adaptive critic/GP tuning based on w_ma (next step)
+            # UNIDIRECTIONAL: Only weaken critic, never strengthen (prevents oscillations)
+            if bool(getattr(args, "adaptive_critic", False)):
+                try:
+                    w_low = float(getattr(args, "w_ma_low", -5.0) or -5.0)
+                    cs_min = int(getattr(args, "critic_steps_min", 1) or 1)
+                    gp_max = float(getattr(args, "lambda_gp_max", getattr(args, "lambda_gp", 0.0)) or 0.0)
+                    gp_up = float(getattr(args, "gp_adapt_factor", 1.5) or 1.5)
+                    prev_cs = int(critic_steps_cur)
+                    prev_gp = float(lambda_gp_cur)
+                    if w_gap_ma < w_low:
+                        # Critic too dominant → reduce critic steps, strengthen GP
+                        critic_steps_cur = max(cs_min, prev_cs - 1)
+                        lambda_gp_cur = min(gp_max if gp_max > 0.0 else prev_gp, prev_gp * gp_up if gp_up > 1.0 else prev_gp)
+                    # No upward reversal: once weakened, stay weakened
+                    if writer is not None and (prev_cs != int(critic_steps_cur) or abs(prev_gp - float(lambda_gp_cur)) > 1e-12):
+                        try:
+                            writer.add_scalar("adapt/critic_steps", float(critic_steps_cur), train_steps_done)
+                            writer.add_scalar("adapt/lambda_gp", float(lambda_gp_cur), train_steps_done)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Update progress bar
+            batch_pbar.set_postfix(
+                c_loss=f"{c_loss:.4f}",
+                g_loss=f"{g_loss:.4f}",
+                m_loss=f"{m_loss:.4f}",
+                w_gap=f"{w_gap:.4f}",
+                w_ma=f"{w_gap_ma:.4f}",
+            )
+            
+            # Periodic logging
+            log_interval = int(getattr(args, "log_interval", 100) or 100)
+            if batches_seen_global % log_interval == 0:
+                gpu_stats = gpu_tracker.get_averaged_stats()
+                gpu_str = ""
+                if gpu_stats:
+                    try:
+                        dev_idx = int(gpu_stats.get("device_idx", -1))
+                    except Exception:
+                        dev_idx = -1
+                    free = gpu_stats.get("free_mib", float("nan"))
+                    active = gpu_stats.get("active_mib", float("nan"))
+                    inact = gpu_stats.get("inactive_split_mib", float("nan"))
+                    total = gpu_stats.get("total_mib", float("nan"))
+                    alloc = gpu_stats.get("alloc_mib", float("nan"))
+                    usage_pct = float("nan")
+                    try:
+                        total_f = float(total)
+                        alloc_f = float(alloc)
+                        if total_f == total_f and total_f > 0:
+                            usage_pct = (alloc_f / total_f) * 100.0
+                    except Exception:
+                        pass
+                    gpu_str = (
+                        f"cuda:{dev_idx} alloc={alloc:.0f}MiB res={gpu_stats.get('reserved_mib', float('nan')):.0f}MiB "
+                        f"max_alloc={gpu_stats.get('max_alloc_mib', float('nan')):.0f}MiB "
+                        f"active={active:.0f}MiB inact_split={inact:.0f}MiB free={free:.0f}MiB "
+                        f"usage={usage_pct:.1f}%"
+                    )
+                tqdm.write(
+                    f"[global] batches={batches_seen_global} events={events_seen_global} muons={muons_seen_global} "
+                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f} w_gap={w_gap:.4f} w_ma={w_gap_ma:.4f} "
+                    f"cs={int(critic_steps_cur)} gp={float(lambda_gp_cur):.4f} "
+                    f"{gpu_str}"
+                )
+                
+                # TensorBoard logging
+                if writer is not None:
+                    writer.add_scalar("train/c_loss", c_loss, train_steps_done)
+                    writer.add_scalar("train/g_loss", g_loss, train_steps_done)
+                    writer.add_scalar("train/m_loss", m_loss, train_steps_done)
+                    writer.add_scalar("train/w_gap", w_gap, train_steps_done)
+                    writer.add_scalar("train/w_gap_ma_500", w_gap_ma, train_steps_done)
+        
+        batch_pbar.close()
+        
+        # Final checkpoint save
+        save_progress(args.checkpoint, progress_epoch, processed_files, fs=checkpoint_fs)
+        save_model_checkpoint(args.model_checkpoint, gen, crit, opt_G, opt_C, fs=model_checkpoint_fs)
+        
+        tqdm.write(f"\nMulti-file training complete. Total batches: {batches_seen_global}")
+        
+    else:
+        # Original sequential file processing (existing code path)
+        file_pbar = tqdm(files_to_process, desc="Files", unit="file")
+        for file_idx, file_path in enumerate(file_pbar, start=1):
+            file_pbar.set_description(f"Processing {os.path.basename(file_path)}")
+
+            if prefetcher is not None:
+                file_pbar.set_postfix(prefetch=prefetcher.progress_string())
+
+            # In non-interactive environments, tqdm may not render well. Emit a
+            # clear per-file marker to stdout.
+            tqdm.write(f"[file {file_idx}/{len(files_to_process)}] start source={file_path}")
+
+            read_path = file_path
+            cached_local_path = None
+            if getattr(args, "prefetch_dir", None) and is_pelican_path(file_path):
+                cached = pelican_uri_to_local_cache_path(file_path, cache_dir=args.prefetch_dir)
+                cached_local_path = cached
+                if prefetcher is not None and file_path in prefetcher.uri_to_index:
+                    prefetcher.update_current_uri(file_path)
+                    file_pbar.set_postfix(prefetch=prefetcher.progress_string())
+                    prefetcher.wait_for(file_path)
+                    file_pbar.set_postfix(prefetch=prefetcher.progress_string())
+                    read_path = cached
+                elif os.path.exists(cached) and os.path.getsize(cached) > 0:
+                    read_path = cached
+
+            if read_path != file_path:
+                tqdm.write(f"[file {file_idx}/{len(files_to_process)}] read_path={read_path} (cached)")
+            else:
+                tqdm.write(f"[file {file_idx}/{len(files_to_process)}] read_path={read_path}")
+
+            # Fail fast with a more actionable message than a deep h5py traceback.
+            if not is_pelican_path(read_path) and not os.path.exists(read_path):
+                raise FileNotFoundError(
+                    f"Input file not found: {read_path}\n"
+                    "If this is a host filesystem path (e.g. /icecube/...), make sure it is available/mounted in your environment.\n"
+                    "If you intended to read via Pelican, pass a pelican:// URI (and optionally --federation-url/--token)."
+                )
+
+            file_format = infer_file_format(read_path)
+
+            fed_for_read = args.federation_url if is_pelican_path(read_path) else None
+            token_for_read = args.token if is_pelican_path(read_path) else None
+
+            # Parquet and pelican:// inputs require the HF streaming loader in this repo.
+            use_hf_for_file = bool(args.use_hf) or file_format == "parquet" or is_pelican_path(read_path)
+            if (not args.use_hf) and use_hf_for_file and (file_format == "parquet" or is_pelican_path(read_path)):
+                print(
+                    f"Info: using HF streaming loader for {file_format} input: {read_path} "
+                    "(add --use-hf to enable this explicitly)."
+                )
+
+            tqdm.write(
+                f"[file {file_idx}/{len(files_to_process)}] loader={'hf_streaming' if use_hf_for_file else 'hdf5_local'} format={file_format}"
+            )
+            
+            if use_hf_for_file:
+                # Fast-path for parquet: yield already-batched tensors directly from Arrow
+                # record batches to reduce Python/HF collation overhead.
+                if file_format == "parquet" and bool(getattr(args, "parquet_batch_reader", False)):
+                    dataset = get_parquet_batch_dataset(
+                        [read_path],
+                        batch_size=args.batch_size,
+                        federation_url=fed_for_read,
+                        token=token_for_read,
+                        memory_cache=memory_cache,
+                        shuffle=bool(getattr(args, "shuffle", False)),
+                        shuffle_seed=int(getattr(args, "shuffle_seed", 42)),
+                    )
+                    collate = None
+                else:
+                    dataset = get_hf_dataset(
+                        [read_path],
+                        file_format=file_format,
+                        streaming=True,
+                        federation_url=fed_for_read,
+                        token=token_for_read,
+                        memory_cache=memory_cache,
+                    )
+                    collate = hf_collate_fn
+            else:
+                # Local HDF5 fast-path.
+                dataset = SingleHDF5Dataset(read_path)
+                collate = ragged_collate_fn
+
+            num_workers = int(getattr(args, "num_workers", 0) or 0)
+            if (not use_hf_for_file) and num_workers > 0:
+                print(
+                    "Warning: --num-workers>0 is not supported for local HDF5 fast-path; forcing --num-workers=0 for this file."
+                )
+                num_workers = 0
+
+            if collate is not None and num_workers > 0:
+                print(
+                    "Warning: --num-workers>0 is currently only supported with --parquet-batch-reader (already-batched dataset). "
+                    "Forcing --num-workers=0 for this file."
+                )
+                num_workers = 0
+
+            dl_kwargs = {
+                "num_workers": num_workers,
+                "pin_memory": bool(getattr(args, "pin_memory", False)),
+            }
+            if num_workers > 0:
+                dl_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2) or 2)
+                dl_kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
+
+            if collate is None:
+                # Dataset already yields fully-formed batches.
+                dataloader = DataLoader(dataset, batch_size=None, **dl_kwargs)
+            else:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=args.batch_size,
+                    collate_fn=collate,
+                    **dl_kwargs,
+                )
+
+            # For streaming datasets, measuring how long we spend waiting for the
+            # next batch (I/O + decode + collate) vs training compute is useful.
+            data_iter = iter(dataloader)
+            batch_prefetch = int(getattr(args, "prefetch_batches", 0) or 0)
+            if batch_prefetch > 0:
+                data_iter = PrefetchIterator(data_iter, max_prefetch=batch_prefetch)
+            batch_pbar = tqdm(desc="Batches", unit="batch", leave=False)
+            batches_seen = 0
+            events_seen = 0
+            muons_seen = 0
+            skipped_empty = 0
+            reported_first_batch = False
 
         profile_steps = int(getattr(args, "profile_steps", 0) or 0)
         steps_profiled = 0
@@ -617,6 +1096,31 @@ def main(args):
             counts_cpu = counts.detach().cpu()
             counts_sum_val = int(counts_cpu.sum().item())
             counts_numel_val = int(counts.numel())
+
+            # Drop zero-muon events (unbatched). Also remap batch_idx to new event indices.
+            if bool(getattr(args, "drop_empty_events", False)):
+                keep_mask = counts_cpu > 0
+                dropped = counts_numel_val - int(keep_mask.sum().item())
+                if dropped > 0:
+                    skipped_empty += dropped
+                    # Filter events and primaries
+                    counts = counts[keep_mask]
+                    prims = prims[keep_mask]
+                    counts_cpu = counts_cpu[keep_mask]
+                    counts_sum_val = int(counts_cpu.sum().item())
+                    counts_numel_val = int(counts.numel())
+                    
+                    # Remap batch_idx and filter muons to kept events only
+                    if batch_idx.numel() > 0:
+                        # Create mapping: old event index -> new event index
+                        old_to_new = torch.full((counts_numel_val + dropped,), -1, dtype=torch.long)
+                        old_to_new[keep_mask] = torch.arange(counts_numel_val, dtype=torch.long)
+                        # Keep muons that belong to kept events
+                        muons_keep = old_to_new[batch_idx] >= 0
+                        real_muons = real_muons[muons_keep]
+                        batch_idx = old_to_new[batch_idx[muons_keep]]
+                if counts_numel_val == 0 or counts_sum_val == 0:
+                    continue
             
             events_seen += counts_numel_val
             muons_seen += counts_sum_val
@@ -801,8 +1305,8 @@ def main(args):
                     sub_batch_idx,
                     sub_prims_norm,
                     sub_counts,
-                    lambda_gp=args.lambda_gp,
-                    critic_steps=int(getattr(args, "critic_steps", 1) or 1),
+                    lambda_gp=lambda_gp_cur,
+                    critic_steps=int(critic_steps_cur),
                     gp_max_pairs=int(getattr(args, "gp_max_pairs", 0) or 0),
                     gp_sample_fraction=float(getattr(args, "gp_sample_fraction", 0.0) or 0.0),
                     gp_every=int(getattr(args, "gp_every", 1) or 1),
@@ -843,11 +1347,21 @@ def main(args):
                 # Batch transfer of counts to CPU for fast loop iteration
                 counts_cpu_list = counts_cpu.tolist()
                 while start_ev < bsz:
+                    # Optionally advance past zero-muon events
+                    if bool(getattr(args, "drop_empty_events", False)):
+                        while start_ev < bsz and int(counts_cpu_list[start_ev]) == 0:
+                            skipped_empty += 1
+                            start_ev += 1
+                        if start_ev >= bsz:
+                            break
                     # Choose an end_ev so sum(counts[start_ev:end_ev]) <= max_muons, at least 1 event.
                     cum = 0
                     end_ev = start_ev
                     while end_ev < bsz:
                         c = counts_cpu_list[end_ev]
+                        # If dropping empty events, stop the contiguous range at the first zero
+                        if bool(getattr(args, "drop_empty_events", False)) and int(c) == 0:
+                            break
                         # Corner case: a single event can exceed max_muons. In that case,
                         # microbatching cannot bound memory, so we skip the event to avoid
                         # catastrophic allocation spikes that can ratchet reserved memory upward.
@@ -875,7 +1389,7 @@ def main(args):
                         skipped_empty += 1
                         start_ev = end_ev
                         continue
-                    # Skip all-zero microbatches (can happen with many 0-muon events).
+                    # Skip all-zero microbatches (can happen when not dropping empty events).
                     sub_counts_sum = int(sub_counts_cpu.sum().item())
                     if sub_counts_sum > 0:
                         sub_prims = prims_feats[start_ev:end_ev]
@@ -923,6 +1437,29 @@ def main(args):
                 except Exception:
                     pass
             w_gap_ma = (w_gap_sum / max(1, len(w_gap_hist)))
+
+            # Adaptive critic/GP tuning based on w_ma (next step)
+            # UNIDIRECTIONAL: Only weaken critic, never strengthen (prevents oscillations)
+            if bool(getattr(args, "adaptive_critic", False)):
+                try:
+                    w_low = float(getattr(args, "w_ma_low", -5.0) or -5.0)
+                    cs_min = int(getattr(args, "critic_steps_min", 1) or 1)
+                    gp_max = float(getattr(args, "lambda_gp_max", getattr(args, "lambda_gp", 0.0)) or 0.0)
+                    gp_up = float(getattr(args, "gp_adapt_factor", 1.5) or 1.5)
+                    prev_cs = int(critic_steps_cur)
+                    prev_gp = float(lambda_gp_cur)
+                    if w_gap_ma < w_low:
+                        critic_steps_cur = max(cs_min, prev_cs - 1)
+                        lambda_gp_cur = min(gp_max if gp_max > 0.0 else prev_gp, prev_gp * gp_up if gp_up > 1.0 else prev_gp)
+                    # No upward reversal: once weakened, stay weakened
+                    if writer is not None and (prev_cs != int(critic_steps_cur) or abs(prev_gp - float(lambda_gp_cur)) > 1e-12):
+                        try:
+                            writer.add_scalar("adapt/critic_steps", float(critic_steps_cur), train_steps_done)
+                            writer.add_scalar("adapt/lambda_gp", float(lambda_gp_cur), train_steps_done)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             t_step1 = time.perf_counter()
             step_time_s += (t_step1 - t_step0)
@@ -1110,7 +1647,8 @@ def main(args):
                     f"skipped_empty={skipped_empty} skipped_oversize={skipped_oversize} written_oversize={written_oversize} "
                     f"rate: {bps:.2f} batch/s {eps:.1f} evt/s {mps:.1f} mu/s "
                     f"avg: load={avg_load_ms:.1f}ms step={avg_step_ms:.1f}ms "
-                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f} w_gap={w_gap:.4f} w_ma={w_gap_ma:.4f}"
+                    f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f} w_gap={w_gap:.4f} w_ma={w_gap_ma:.4f} "
+                    f"cs={int(critic_steps_cur)} gp={float(lambda_gp_cur):.4f}"
                     f"{mem_s}"
                 )
 
@@ -1196,6 +1734,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help=(
+            "Shuffle training data within each file. Loads entire file into memory, shuffles all examples, "
+            "then creates batches. Prevents overfitting to data structure (e.g., primary/depth ordering). "
+            "Warning: requires sufficient memory to hold entire file."
+        ),
+    )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible shuffling (default: 42).",
+    )
+    parser.add_argument(
         "--prefetch-batches",
         type=int,
         default=0,
@@ -1248,6 +1801,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--drop-empty-events",
+        action="store_true",
+        help=(
+            "When microbatching, skip events with zero muons entirely (do not include them in event ranges). "
+            "Reduces wasted work when many events have count=0."
+        ),
+    )
+    parser.add_argument(
         "--outliers-dir",
         type=str,
         default=None,
@@ -1264,6 +1825,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Batch size for the PyTorch DataLoader (default: 1024).",
     )
     parser.add_argument(
+        "--multi-file-shuffle",
+        type=int,
+        default=0,
+        help=(
+            "Number of files to process concurrently with batch-level shuffling. "
+            "When > 0, batches are sampled round-robin from N files simultaneously "
+            "to prevent overfitting to individual file distributions. Default: 0 (sequential processing)."
+        ),
+    )
+    parser.add_argument(
         "--critic-steps",
         type=int,
         default=1,
@@ -1275,6 +1846,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Alias for --critic-steps (kept for backward compatibility).",
+    )
+    parser.add_argument(
+        "--adaptive-critic",
+        action="store_true",
+        help=(
+            "Adapt critic steps and gradient penalty based on Wasserstein moving average. "
+            "When enabled: if w_ma < --w-ma-low, reduce critic steps and increase GP; "
+            "if w_ma > --w-ma-high, increase critic steps and decrease GP."
+        ),
+    )
+    parser.add_argument(
+        "--w-ma-low",
+        type=float,
+        default=-5.0,
+        help="Lower threshold for w_ma to trigger critic/GP adjustment (default: -5.0).",
+    )
+    parser.add_argument(
+        "--w-ma-high",
+        type=float,
+        default=10.0,
+        help="Upper threshold for w_ma to trigger critic/GP adjustment (default: 10.0).",
+    )
+    parser.add_argument(
+        "--critic-steps-min",
+        type=int,
+        default=1,
+        help="Minimum critic steps when adaptation is enabled (default: 1).",
+    )
+    parser.add_argument(
+        "--critic-steps-max",
+        type=int,
+        default=3,
+        help="Maximum critic steps when adaptation is enabled (default: 3).",
+    )
+    parser.add_argument(
+        "--lambda-gp-min",
+        type=float,
+        default=None,
+        help=(
+            "Minimum gradient penalty weight for adaptation. Default: use --lambda-gp."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-gp-max",
+        type=float,
+        default=None,
+        help=(
+            "Maximum gradient penalty weight for adaptation. Default: use --lambda-gp (no change)."
+        ),
+    )
+    parser.add_argument(
+        "--gp-adapt-factor",
+        type=float,
+        default=1.5,
+        help=(
+            "Multiplicative factor to change gradient penalty during adaptation (default: 1.5)."
+        ),
     )
     parser.add_argument(
         "--torch-compile",
@@ -1623,6 +2251,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "If >0, profile the first N training steps using torch.profiler and print timing breakdown. "
             "Useful for identifying bottlenecks (default: 0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        help=(
+            "Enable torch.autograd.set_detect_anomaly(True) to detect inplace operations that break autograd. "
+            "Prints detailed error messages but slows down training significantly. Use for debugging only."
         ),
     )
 

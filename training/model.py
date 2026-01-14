@@ -58,6 +58,17 @@ class ScalableGenerator(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(64, self.feature_dim)
         )
+        
+        # Initialize weights for stable training
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize network weights for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.5)  # Conservative gain for stability
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, conditions):
         """Generate muons for a batch of events.
@@ -87,7 +98,9 @@ class ScalableGenerator(nn.Module):
         # Use the predicted multiplicity (log10 normalized) in the global context
         multiplicity_normalized = mul_log10_clean
         
+        # Concatenate inputs for global network
         global_input = torch.cat([global_noise, conditions, multiplicity_normalized], dim=1)
+        
         event_context = self.global_net(global_input)  # [batch_size, HIDDEN_DIM]
         
         # 3. Expand Event Context to Match Individual Muons
@@ -100,13 +113,64 @@ class ScalableGenerator(nn.Module):
         local_noise = torch.empty((flat_context.size(0), self.latent_dim_local), device=self.device).normal_()
         
         # 5. Generate Muon Features
+        # Concatenate global context and local noise
         local_input = torch.cat([flat_context, local_noise], dim=1)
+        
         flat_muons = self.local_net(local_input)  # [total_muons, feature_dim]
         
         # 6. Create Batch Index for Scatter Operations
         # Maps each muon back to its event: e.g., [0, 0, 1, 1, 1] for [2, 3] muons per event
         batch_index = torch.repeat_interleave(torch.arange(batch_size, device=self.device), repeats)
         
+        return flat_muons, batch_index
+
+    def generate_with_counts(self, conditions, counts):
+        """Generate muons with externally provided per-event counts.
+        
+        Args:
+            conditions: [batch_size, cond_dim] event conditions
+            counts: [batch_size] desired muon counts per event (int/long)
+        
+        Returns:
+            flat_muons: [total_muons, feature_dim]
+            batch_index: [total_muons]
+        """
+        batch_size = conditions.size(0)
+
+        # Sanitize counts
+        if not isinstance(counts, torch.Tensor):
+            counts = torch.tensor(counts, device=self.device, dtype=torch.long)
+        else:
+            counts = counts.to(self.device)
+        counts = torch.nan_to_num(counts.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0).round().long()
+
+        # Global context uses log10(N+1) to match training semantics
+        multiplicity_normalized = torch.log10(counts.float().unsqueeze(1) + 1.0)
+
+        # Global Context per Event
+        global_noise = torch.randn(batch_size, self.latent_dim_global, device=self.device)
+        global_input = torch.cat([global_noise, conditions, multiplicity_normalized], dim=1)
+        event_context = self.global_net(global_input)  # [batch_size, HIDDEN_DIM]
+
+        # Expand Event Context for each muon
+        repeats = counts  # [batch_size]
+        # Avoid .item() sync - check if any events have muons without CPU transfer
+        if repeats.sum() == 0:
+            # Return empty tensors on device
+            empty_mu = torch.empty((0, self.feature_dim), device=self.device)
+            empty_idx = torch.empty((0,), dtype=torch.long, device=self.device)
+            return empty_mu, empty_idx
+
+        flat_context = torch.repeat_interleave(event_context, repeats, dim=0)
+
+        # Per-muon noise and local generation
+        local_noise = torch.empty((flat_context.size(0), self.latent_dim_local), device=self.device).normal_()
+        local_input = torch.cat([flat_context, local_noise], dim=1)
+        flat_muons = self.local_net(local_input)
+
+        # Batch index mapping
+        batch_index = torch.repeat_interleave(torch.arange(batch_size, device=self.device), repeats)
+
         return flat_muons, batch_index
 
 # ==========================================
@@ -127,21 +191,39 @@ class ScalableCritic(nn.Module):
         self.cond_dim = cond_dim
         self.device = device
         self.pooling_mode = str(pooling_mode or "amax").lower()
+        
+        # Pre-allocate pooling buffer (will be resized as needed, but reduces allocations)
+        self._pooling_buffer = None
+        self._pooling_buffer_size = 0
 
         # Per-Muon Feature Processor: Conditioned on event context
         self.point_net = nn.Sequential(
             nn.Linear(feat_dim + cond_dim, 64),
+            nn.LayerNorm(64),
             nn.LeakyReLU(0.2),
             nn.Linear(64, 128),
+            nn.LayerNorm(128),
             nn.LeakyReLU(0.2)
         )
         
         # Event-Level Decision Network: Operates on aggregated muon features
         self.decision_net = nn.Sequential(
             nn.Linear(128 + cond_dim, 128),
+            nn.LayerNorm(128),
             nn.LeakyReLU(0.2),
             nn.Linear(128, 1)
         )
+        
+        # Initialize weights for stable training
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize network weights for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.5)  # Conservative gain for stability
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, flat_muons, batch_index, conditions, batch_size):
         """Score events based on muon distributions.
@@ -166,19 +248,37 @@ class ScalableCritic(nn.Module):
         point_feats = torch.nan_to_num(point_feats, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 3. Aggregate Muon Scores via Pooling
+        # Reuse pre-allocated buffer to reduce aten::full calls (major bottleneck)
+        required_size = batch_size * 128
+        
+        # Resize buffer if needed (rare, only when batch_size increases)
+        if self._pooling_buffer is None or self._pooling_buffer_size < required_size:
+            # Allocate with 20% headroom to reduce future reallocations
+            alloc_size = int(required_size * 1.2)
+            if self.pooling_mode == "amax":
+                self._pooling_buffer = torch.full((alloc_size,), -1e9, device=self.device)
+            else:
+                self._pooling_buffer = torch.zeros((alloc_size,), device=self.device)
+            self._pooling_buffer_size = alloc_size
+        
+        # Clone first to avoid inplace modification issues with autograd
+        # (slight overhead but still much faster than torch.full each time)
+        global_feats = self._pooling_buffer[:required_size].clone().view(batch_size, 128)
+        
+        # Now safe to use inplace operations on the clone
         if self.pooling_mode == "amax":
-            global_feats = torch.full((batch_size, 128), -1e9, device=self.device)
+            global_feats.fill_(-1e9)
             global_feats.scatter_reduce_(
                 0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="amax"
             )
         elif self.pooling_mode == "mean":
-            global_feats = torch.zeros((batch_size, 128), device=self.device)
+            global_feats.fill_(0.0)
             global_feats.scatter_reduce_(
                 0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="mean"
             )
         else:
             # Fallback to amax if an unknown mode is provided
-            global_feats = torch.full((batch_size, 128), -1e9, device=self.device)
+            global_feats.fill_(-1e9)
             global_feats.scatter_reduce_(
                 0, batch_index.unsqueeze(1).expand(-1, 128), point_feats, reduce="amax"
             )
@@ -193,9 +293,9 @@ class ScalableCritic(nn.Module):
         # This prevents gradient explosion when batch_size is large
         score = score / max(1.0, float(batch_size) ** 0.5)
         
-        # Clamp to prevent unbounded growth of critic weights
-        # Wasserstein distance should be in [-1000, 1000] range for stable training
-        score = torch.clamp(score, min=-1000.0, max=1000.0)
+        # Smooth saturation instead of hard clamp to preserve gradients
+        # tanh provides soft boundaries while allowing gradient flow
+        score = 100.0 * torch.tanh(score / 100.0)
         
         return score
 
@@ -278,6 +378,7 @@ def train_step_scalable(
     gp_sample_fraction: float = 0.0,
     gp_every: int = 1,
     grad_clip_norm: float = 0.0,
+    grad_accum_steps: int = 1,
     device="cpu",
 ):
     """Single training step for Wasserstein GAN with gradient penalty.
@@ -298,6 +399,7 @@ def train_step_scalable(
         real_counts: True muon counts per event [batch_size]
         lambda_gp: Gradient penalty weight
         critic_steps: Number of critic updates per generator update
+        grad_accum_steps: Number of gradient accumulation steps (default: 1 = no accumulation)
         device: Device to run computations on
         
     Returns:
@@ -306,6 +408,7 @@ def train_step_scalable(
     batch_size = real_cond.size(0)
     
     critic_steps = int(max(1, critic_steps))
+    grad_accum_steps = int(max(1, grad_accum_steps))
     loss_critic = None
     loss_multiplicity = None
     w_gap_val = 0.0
@@ -318,17 +421,22 @@ def train_step_scalable(
         real_counts_tensor = torch.tensor(real_counts, device=device, dtype=torch.float32).unsqueeze(1)
     target_multiplicity = torch.log10(real_counts_tensor + 1)
     
-    opt_G.zero_grad()
+    # Gradient accumulation for multiplicity predictor
+    if grad_accum_steps == 1:
+        opt_G.zero_grad()
     pred_multiplicity = gen.multiplicity_net(real_cond)
     loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
-    loss_multiplicity.backward()
-    if float(grad_clip_norm) > 0.0:
-        torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
-    opt_G.step()
+    loss_multiplicity_scaled = loss_multiplicity / grad_accum_steps
+    loss_multiplicity_scaled.backward()
+    if grad_accum_steps == 1:
+        if float(grad_clip_norm) > 0.0:
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
+        opt_G.step()
 
     # ===== Update Critic =====
     for ci in range(int(critic_steps)):
-        opt_C.zero_grad()
+        if grad_accum_steps == 1:
+            opt_C.zero_grad()
 
         # Generate fake samples (generator predicts its own multiplicity)
         fake_muons_flat, fake_batch_idx = gen(real_cond)
@@ -364,22 +472,58 @@ def train_step_scalable(
                     real_offsets[1:] = torch.cumsum(real_counts_ev[:-1], dim=0)
                     fake_offsets[1:] = torch.cumsum(fake_counts_ev[:-1], dim=0)
 
-                # Collect aligned slices
+                # Collect aligned slices - FULLY vectorized (no .item() calls)
+                nonzero_events = (k_ev > 0).nonzero(as_tuple=False).squeeze(1)
+                
                 idx_real_list = []
                 idx_fake_list = []
                 batch_sub_list = []
-                nonzero_events = (k_ev > 0).nonzero(as_tuple=False).squeeze(1)
-                # Batch transfer to CPU before loop to avoid repeated GPU syncs
-                k_ev_cpu = k_ev.cpu()
-                real_offsets_cpu = real_offsets.cpu()
-                fake_offsets_cpu = fake_offsets.cpu()
-                for e in nonzero_events.tolist():
-                    k = int(k_ev_cpu[e].item())
-                    r_start = int(real_offsets_cpu[e].item())
-                    f_start = int(fake_offsets_cpu[e].item())
-                    idx_real_list.append(real_sorted_idx[r_start:r_start + k])
-                    idx_fake_list.append(fake_sorted_idx[f_start:f_start + k])
-                    batch_sub_list.append(torch.full((k,), e, dtype=torch.long, device=device))
+                
+                # Fully vectorized: work entirely on GPU tensors
+                if nonzero_events.numel() > 0:
+                    # Extract all k, r_start, f_start values at once (no loops, no .item())
+                    k_vals = k_ev[nonzero_events]  # [num_nonzero]
+                    r_starts = real_offsets[nonzero_events]  # [num_nonzero]
+                    f_starts = fake_offsets[nonzero_events]  # [num_nonzero]
+                    
+                    # Create all index ranges at once using advanced indexing
+                    # For each event: create range [start, start+k)
+                    total_pairs = k_vals.sum()  # Total number of muon pairs
+                    
+                    if total_pairs > 0:
+                        # Build index offsets for each event's range
+                        event_range_offsets = torch.zeros(nonzero_events.numel() + 1, dtype=torch.long, device=device)
+                        event_range_offsets[1:] = torch.cumsum(k_vals, dim=0)
+                        
+                        # Create flat indices into sorted arrays
+                        # This creates [0,1,...,k0-1, 0,1,...,k1-1, ...] pattern
+                        # Note: This list comprehension requires one CPU sync for k_vals.tolist()
+                        # but it's much better than 4 × num_events .item() calls in the old loop
+                        pair_idx_within_event = torch.cat([
+                            torch.arange(k, dtype=torch.long, device=device) 
+                            for k in k_vals.cpu().tolist()
+                        ])
+                        
+                        # Map each pair to its event index
+                        event_id_per_pair = torch.repeat_interleave(
+                            torch.arange(nonzero_events.numel(), dtype=torch.long, device=device),
+                            k_vals
+                        )
+                        
+                        # Compute global indices: start[event] + offset_within_event
+                        idx_r = r_starts[event_id_per_pair] + pair_idx_within_event
+                        idx_f = f_starts[event_id_per_pair] + pair_idx_within_event
+                        
+                        # Remap to original sorted indices
+                        idx_r = real_sorted_idx[idx_r]
+                        idx_f = fake_sorted_idx[idx_f]
+                        
+                        # Create batch indices
+                        batch_idx_sub = nonzero_events[event_id_per_pair]
+                        
+                        idx_real_list.append(idx_r)
+                        idx_fake_list.append(idx_f)
+                        batch_sub_list.append(batch_idx_sub)
 
                 if idx_real_list:
                     idx_r = torch.cat(idx_real_list)
@@ -425,22 +569,27 @@ def train_step_scalable(
 
         # Wasserstein distance: minimize (fake - real)
         loss_critic = fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty
-        loss_critic.backward()
-        if float(grad_clip_norm) > 0.0:
-            torch.nn.utils.clip_grad_norm_(crit.parameters(), float(grad_clip_norm))
-        opt_C.step()
+        loss_critic_scaled = loss_critic / grad_accum_steps
+        loss_critic_scaled.backward()
+        if grad_accum_steps == 1:
+            if float(grad_clip_norm) > 0.0:
+                torch.nn.utils.clip_grad_norm_(crit.parameters(), float(grad_clip_norm))
+            opt_C.step()
     
     # ===== Update Generator =====
-    opt_G.zero_grad()
+    if grad_accum_steps == 1:
+        opt_G.zero_grad()
     
     # Re-evaluate fakes with gradients enabled for generator
     fake_score_G = crit(fake_muons_flat, fake_batch_idx, real_cond, batch_size)
     loss_generator = -fake_score_G.mean()  # Maximize critic score
+    loss_generator_scaled = loss_generator / grad_accum_steps
     
-    loss_generator.backward()
-    if float(grad_clip_norm) > 0.0:
-        torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
-    opt_G.step()
+    loss_generator_scaled.backward()
+    if grad_accum_steps == 1:
+        if float(grad_clip_norm) > 0.0:
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
+        opt_G.step()
 
     return (
         float(loss_critic.item()) if loss_critic is not None else 0.0,
