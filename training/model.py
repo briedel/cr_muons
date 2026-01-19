@@ -195,6 +195,10 @@ class ScalableCritic(nn.Module):
         # Pre-allocate pooling buffer (will be resized as needed, but reduces allocations)
         self._pooling_buffer = None
         self._pooling_buffer_size = 0
+        
+        # Running statistics for score normalization (decoupled from batch size)
+        self.register_buffer("_score_norm_ema", torch.tensor(1.0, device=device))  # Exponential moving average
+        self._score_norm_momentum = 0.99  # How much to weight old statistics
 
         # Per-Muon Feature Processor: Conditioned on event context
         self.point_net = nn.Sequential(
@@ -211,7 +215,10 @@ class ScalableCritic(nn.Module):
             nn.Linear(128 + cond_dim, 128),
             nn.LayerNorm(128),
             nn.LeakyReLU(0.2),
-            nn.Linear(128, 1)
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),  # Normalize before final layer to keep values bounded
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1)
         )
         
         # Initialize weights for stable training
@@ -289,13 +296,20 @@ class ScalableCritic(nn.Module):
         decision_input = torch.cat([global_feats, conditions], dim=1)
         score = self.decision_net(decision_input)
         
-        # Normalize score by batch size to keep Wasserstein loss in reasonable range
-        # This prevents gradient explosion when batch_size is large
-        score = score / max(1.0, float(batch_size) ** 0.5)
+        # Update running norm statistic (momentum = 0.99 means slow decay)
+        # This keeps scores normalized without depending on batch size
+        score_magnitude = score.abs().mean().detach()
+        with torch.no_grad():
+            self._score_norm_ema.mul_(self._score_norm_momentum).add_(score_magnitude, alpha=1 - self._score_norm_momentum)
         
-        # Smooth saturation instead of hard clamp to preserve gradients
-        # tanh provides soft boundaries while allowing gradient flow
-        score = 100.0 * torch.tanh(score / 100.0)
+        # Normalize score by running statistics, then soft-saturate
+        # norm_eps prevents division by near-zero early in training
+        norm_eps = 0.1
+        normalized_score = score / max(float(self._score_norm_ema.item()), norm_eps)
+        
+        # Clamp + tanh ensures stability: prevents saturation but keeps bounded
+        score = torch.clamp(normalized_score, -5.0, 5.0)
+        score = 10.0 * torch.tanh(score / 5.0)  # Map [-5, 5] → [-10, 10]
         
         return score
 
@@ -342,8 +356,8 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
         outputs=d_interpolates,
         inputs=interpolates,
         grad_outputs=fake_labels,
-        create_graph=True,
-        retain_graph=True,
+        create_graph=True, #gemini claims this is required # No second-order derivatives; preserves gradient flow & saves memory
+        retain_graph=True,  # Safe to free after grad computation
         only_inputs=True
     )[0]
     
@@ -354,14 +368,19 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
     grad_norms = torch.nan_to_num(grad_norms, nan=0.0, posinf=10.0, neginf=0.0).clamp_max(10.0)
     gradient_penalty = ((grad_norms - 1) ** 2).mean()
     
+    # NO detach: gradient_penalty must flow back through critic to provide meaningful loss signal
+    
+    # Explicit cleanup: delete large intermediate tensors
+    del interpolates, d_interpolates, gradients, grad_norms, fake_labels, alpha, alpha_expanded
+    
     return gradient_penalty
+
 
 # ==========================================
 # 4. TRAINING LOOP
 # ==========================================
 # Initialize models and optimizers
 # Moved to if __name__ == "__main__": block at the end of file to avoid global variables
-
 
 def train_step_scalable(
     gen,
@@ -378,7 +397,7 @@ def train_step_scalable(
     gp_sample_fraction: float = 0.0,
     gp_every: int = 1,
     grad_clip_norm: float = 0.0,
-    grad_accum_steps: int = 1,
+    grad_accum_steps: int = 16,
     device="cpu",
 ):
     """Single training step for Wasserstein GAN with gradient penalty.
@@ -405,6 +424,10 @@ def train_step_scalable(
     Returns:
         Tuple of (critic_loss, generator_loss, multiplicity_loss, w_gap) as scalars
     """
+    # GEMINI AGAIN 
+    real_cond = real_cond.detach() 
+    real_muons_flat = real_muons_flat.detach()
+
     batch_size = real_cond.size(0)
     
     critic_steps = int(max(1, critic_steps))
@@ -413,6 +436,7 @@ def train_step_scalable(
     loss_multiplicity = None
     w_gap_val = 0.0
 
+    # GEMINI
     # ===== Train Multiplicity Predictor =====
     # Target: log10(real_counts + 1) to match network's output
     if isinstance(real_counts, torch.Tensor):
@@ -424,10 +448,10 @@ def train_step_scalable(
     # Gradient accumulation for multiplicity predictor
     if grad_accum_steps == 1:
         opt_G.zero_grad()
-    pred_multiplicity = gen.multiplicity_net(real_cond)
-    loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
-    loss_multiplicity_scaled = loss_multiplicity / grad_accum_steps
-    loss_multiplicity_scaled.backward()
+    # pred_multiplicity = gen.multiplicity_net(real_cond)
+    # loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
+    # loss_multiplicity_scaled = loss_multiplicity / grad_accum_steps
+    # loss_multiplicity_scaled.backward()
     if grad_accum_steps == 1:
         if float(grad_clip_norm) > 0.0:
             torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
@@ -438,8 +462,12 @@ def train_step_scalable(
         if grad_accum_steps == 1:
             opt_C.zero_grad()
 
-        # Generate fake samples (generator predicts its own multiplicity)
-        fake_muons_flat, fake_batch_idx = gen(real_cond)
+        # GEMINI SUGGESTION: GENERATE FAKES WITHOUT TRACKING GEN GRADIENTS
+        with torch.no_grad():
+            # Generate fake samples (generator predicts its own multiplicity)
+            fake_muons_flat, fake_batch_idx = gen(real_cond)
+            total_muons_in_batch = int(fake_muons_flat.shape[0])
+
 
         # Score real and fake samples (detach fakes to prevent generator gradient flow)
         real_score = crit(real_muons_flat, real_batch_idx, real_cond, batch_size)
@@ -556,6 +584,12 @@ def train_step_scalable(
                 fake_sub = torch.empty((0, real_muons_flat.shape[1]), device=device)
                 batch_idx_sub = torch.empty((0,), dtype=torch.long, device=device)
 
+
+
+        #GEMINI SUGGESTION START
+        # DETACH the fakes for the Critic/GP pass
+        fakes_for_gp = fake_muons_flat.detach().requires_grad_(True)
+
         # Compute Wasserstein loss and gradient penalty on aligned subsets
         gradient_penalty = compute_gp_flat(
             crit,
@@ -568,24 +602,43 @@ def train_step_scalable(
         ) if apply_gp else torch.tensor(0.0, device=device)
 
         # Wasserstein distance: minimize (fake - real)
-        loss_critic = fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty
+        loss_critic = (fake_score.mean() - real_score.mean() + lambda_gp * gradient_penalty)
         loss_critic_scaled = loss_critic / grad_accum_steps
         loss_critic_scaled.backward()
         if grad_accum_steps == 1:
             if float(grad_clip_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(crit.parameters(), float(grad_clip_norm))
             opt_C.step()
+            opt_C.zero_grad() # Clear immediately after step
     
     # ===== Update Generator =====
     if grad_accum_steps == 1:
         opt_G.zero_grad()
+
     
-    # Re-evaluate fakes with gradients enabled for generator
-    fake_score_G = crit(fake_muons_flat, fake_batch_idx, real_cond, batch_size)
-    loss_generator = -fake_score_G.mean()  # Maximize critic score
-    loss_generator_scaled = loss_generator / grad_accum_steps
+# 1. Single Forward Pass
+    # Ensure your Generator returns the predicted multiplicity along with the muons
+    # If it doesn't, we call the multiplicity net as part of the SAME sequence
+    pred_multiplicity = gen.multiplicity_net(real_cond) 
+    curr_fake_muons, curr_fake_idx = gen(real_cond)
     
-    loss_generator_scaled.backward()
+    # 2. Compute both losses
+    loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
+    
+    fake_score_G = crit(curr_fake_muons, curr_fake_idx, real_cond, batch_size)
+    loss_generator = -fake_score_G.mean()
+    
+    # 3. Combined Backward
+    # This is the "Magic" fix: Sum them first, then backward ONCE.
+    total_g_loss = (loss_generator + loss_multiplicity) / grad_accum_steps
+    total_g_loss.backward()
+    
+    # # Re-evaluate fakes with gradients enabled for generator
+    # fake_score_G = crit(fake_muons_flat, fake_batch_idx, real_cond, batch_size)
+    # loss_generator = -fake_score_G.mean()  # Maximize critic score
+    # loss_generator_scaled = loss_generator / grad_accum_steps
+    
+    # loss_generator_scaled.backward()
     if grad_accum_steps == 1:
         if float(grad_clip_norm) > 0.0:
             torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
@@ -596,6 +649,7 @@ def train_step_scalable(
         float(loss_generator.item()),
         float(loss_multiplicity.item()) if loss_multiplicity is not None else 0.0,
         float(w_gap_val),
+        int(total_muons_in_batch)
     )
 
 if __name__ == "__main__":

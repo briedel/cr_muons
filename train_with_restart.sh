@@ -59,21 +59,32 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         stdbuf -oL -eL python -u training/train.py \
         -i "pelican://osg-htc.org/icecube/wipac/data/sim/IceCube/2025/testing/${RANGE_DIR}/*.parquet" \
         --use-hf --parquet-batch-reader \
-        --prefetch-batches 10 --num-workers 4 --prefetch-factor 4 --pin-memory \
-        --batch-size 128000 --log-interval 100 --max-muons-per-event 200000 --max-muons-per-batch 30000000 \
+        --prefetch-batches 100 --num-workers 4 --prefetch-factor 4 --pin-memory \
+        # need to make sure that we consildate options and that --max-muons-per-batch 0 works as intended and 
+        # --preflight-muon-threshold is somehow different and if so, how, and what it does differently
+        # also need to make sure that the united of batches/s and s per batch are well defined and documented, or that we stick with one
+        # NEED TO CHECK THE BATCH being passed to the model training step is indeed 65536 as intended
+        # i am guessing the microbatching is doing something or not working over a certain batch size
+        # i need to figure out how to increment the batch count through restarts such that i can trace the total number of batches seen
+        --batch-size 128000 --log-interval 20 --max-muons-per-event 50000 --max-muons-per-batch 0 \
+        --preflight-muon-threshold 300000 \
+        --cuda-empty-cache-interval 1000 \
+        --cuda-empty-cache-threshold-mib 2048 \
         --drop-empty-events \
+        # need to make sure that the outliers are also used for training
+        --outliers-dir ./outliers_parquet/ \
         --multi-file-shuffle 10 \
         --memory-cache-mb 2048 \
-        --profile-steps 10 \
-        --tb-logdir ./logs_tensorboard/ --tb-hist-interval 10 \
+        # --profile-steps 10 \
+        --tb-logdir ./logs_tensorboard/ --tb-hist-interval 100 \
         --prefetch-dir ./testdata/ --prefetch-delete-after-use --prefetch-max-files 500 --prefetch-ahead 20 \
         --auto-token --checkpoint ./training_checkpoint.json --model-checkpoint ./model_checkpoint.pt \
         --checkpoint-io local --device cuda \
-        --optimizer adam --lr 1e-4 --grad-clip-norm 0.0 \
+        --optimizer adam --lr 0.5e-4 --grad-clip-norm 0.0 \
         --allow-tf32 --lambda-gp 10.0 --gp-max-pairs 4096 --gp-every 2 \
-        --adaptive-critic --critic-steps 2 \
+        --adaptive-critic --critic-steps 5 \
         --w-ma-low -5.0 --w-ma-high 10.0 \
-        --critic-steps-min 1 --critic-steps-max 3 \
+        --critic-steps-min 1 --critic-steps-max 10 \
         --lambda-gp-min 10.0 --lambda-gp-max 20.0 \
         --gp-adapt-factor 1.5
     )
@@ -97,7 +108,7 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         
         # Run training with stdout/stderr tee'd to per-range logs while streaming to screen
         LOG_PREFIX="${RUN_LOG_DIR}/train_${RANGE_LOW}-${RANGE_HIGH}_attempt${attempt}_$(date +%Y%m%d-%H%M%S)"
-        "${TRAIN_CMD[@]}" \
+        PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,expandable_segments:True "${TRAIN_CMD[@]}" \
             > >(tee -a "${LOG_PREFIX}.out.log") \
             2> >(tee -a "${LOG_PREFIX}.err.log" >&2)
         EXIT_CODE=$?

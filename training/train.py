@@ -300,6 +300,18 @@ def main(args):
         device=device
     ).to(device)
     
+    with torch.no_grad():
+        # This targets the final Linear layer of the multiplicity head
+        # We set bias to 2.0 because 10^2.0 = 100 muons.
+        # This prevents the "0 muons" issue at the start of training.
+        if hasattr(gen.multiplicity_net, 'bias'):
+             # If it's a single layer
+            gen.multiplicity_net.bias.fill_(0.5)
+        else:
+            # If it's a Sequential block (most likely), target the last layer [-1]
+            gen.multiplicity_net[-1].bias.fill_(0.5)
+
+
     crit = ScalableCritic(
         feat_dim=args.feat_dim, 
         cond_dim=args.cond_dim, 
@@ -739,7 +751,7 @@ def main(args):
                     )
                     prof.__enter__()
 
-                c_loss_local, g_loss_local, m_loss_local, w_gap_local = train_step_scalable(
+                c_loss_local, g_loss_local, m_loss_local, w_gap_local, total_fake_muons_local = train_step_scalable(
                     gen,
                     crit,
                     opt_G,
@@ -754,6 +766,7 @@ def main(args):
                     gp_sample_fraction=float(getattr(args, "gp_sample_fraction", 0.0) or 0.0),
                     gp_every=int(getattr(args, "gp_every", 1) or 1),
                     grad_clip_norm=float(getattr(args, "grad_clip_norm", 0.0) or 0.0),
+                    grad_accum_steps=int(getattr(args, "grad_accum_steps", 1) or 16),
                     device=device,
                 )
 
@@ -766,16 +779,47 @@ def main(args):
                     except Exception as e:
                         tqdm.write(f"[profile mf error: {e}]")
                     steps_profiled += 1
-                
+
+                vram_used = torch.cuda.memory_allocated(device) / 1024**3
+                vram_peak = torch.cuda.max_memory_reserved(device) / 1024**3
+
+                if w_gap_local < 0:
+                    tqdm.write(f"[Debug] batches={batches_seen_global} Substep losses: c_loss={c_loss_local:.4f} g_loss={g_loss_local:.4f} m_loss={m_loss_local:.4f} w_gap={w_gap_local:.4f}, total_fake_muons={total_fake_muons_local}, vram_used={vram_used:.4f} GB, vram_peak={vram_peak:.4f} GB")
+
                 return c_loss_local, g_loss_local, m_loss_local, w_gap_local
             
-            # Run training step
-            max_muons = int(getattr(args, "max_muons_per_batch", 0) or 0)
-            if max_muons <= 0 or counts_sum_val <= max_muons:
+            # Log batch composition for diagnostics
+            num_events = int(counts_numel_val)
+            total_muons = int(counts_sum_val)
+            avg_muons_per_event = total_muons / num_events if num_events > 0 else 0
+            max_muons_in_batch = int(counts_cpu.max().item()) if num_events > 0 else 0
+            num_large_events = int((counts_cpu > 10000).sum().item())
+
+            # Unified batch cap: prefer preflight threshold if set, otherwise max_muons_per_batch
+            preflight_threshold = int(getattr(args, "preflight_muon_threshold", 0) or 0)
+            max_muons_cfg = int(getattr(args, "max_muons_per_batch", 0) or 0)
+            effective_max_muons = preflight_threshold if preflight_threshold > 0 else max_muons_cfg
+            split_due_to_cap = effective_max_muons > 0 and total_muons > effective_max_muons
+            if split_due_to_cap:
+                tqdm.write(
+                    f"[preflight] splitting batch {batches_seen_global}: total_muons={total_muons} "
+                    f"cap={effective_max_muons} (source={'preflight' if preflight_threshold > 0 else 'max_muons_per_batch'})"
+                )
+                if writer is not None:
+                    writer.add_scalar("data/preflight_split", 1, train_steps_done)
+            elif writer is not None:
+                writer.add_scalar("data/preflight_split", 0, train_steps_done)
+            
+            # Run training step (microbatch if above the effective cap)
+            if effective_max_muons <= 0 or counts_sum_val <= effective_max_muons:
                 c_loss, g_loss, m_loss, w_gap = _run_substep(
                     real_muons_feats, batch_idx, prims_feats, counts
                 )
                 train_steps_done += 1
+                # Explicit cleanup of intermediate tensors
+                import gc
+                del real_muons_feats, batch_idx, prims_feats, counts
+                gc.collect()
             else:
                 # Microbatch by contiguous event ranges so batch_idx slicing is cheap.
                 bsz = counts_numel_val
@@ -787,7 +831,7 @@ def main(args):
 
                 # Derive per-event oversize limit
                 max_event_muons = int(getattr(args, "max_muons_per_event", 0) or 0)
-                event_muon_limit = max_event_muons if max_event_muons > 0 else max_muons
+                event_muon_limit = max_event_muons if max_event_muons > 0 else effective_max_muons
 
                 counts_cpu_list = counts_cpu.tolist()
                 while start_ev < bsz:
@@ -810,11 +854,11 @@ def main(args):
                             end_ev = start_ev + 1
                             cum = 0
                             break
-                        if (end_ev > start_ev) and (cum + c > max_muons):
+                        if (end_ev > start_ev) and (cum + c > effective_max_muons):
                             break
                         cum += c
                         end_ev += 1
-                        if cum >= max_muons:
+                        if cum >= effective_max_muons:
                             break
                     if end_ev <= start_ev:
                         end_ev = start_ev + 1
@@ -859,15 +903,21 @@ def main(args):
             if bool(getattr(args, "adaptive_critic", False)):
                 try:
                     w_low = float(getattr(args, "w_ma_low", -5.0) or -5.0)
+                    w_high = float(getattr(args, "w_ma_high", 5.0) or 5.0)
                     cs_min = int(getattr(args, "critic_steps_min", 1) or 1)
+                    gp_min = float(getattr(args, "lambda_gp_min", 1.0) or 1.0)
                     gp_max = float(getattr(args, "lambda_gp_max", getattr(args, "lambda_gp", 0.0)) or 0.0)
+                    gp_down = float(getattr(args, "gp_adapt_factor_down", 0.9) or 0.9)
                     gp_up = float(getattr(args, "gp_adapt_factor", 1.5) or 1.5)
                     prev_cs = int(critic_steps_cur)
                     prev_gp = float(lambda_gp_cur)
                     if w_gap_ma < w_low:
-                        # Critic too dominant → reduce critic steps, strengthen GP
+                        # Generator too strong → reduce critic steps, strengthen GP
                         critic_steps_cur = max(cs_min, prev_cs - 1)
                         lambda_gp_cur = min(gp_max if gp_max > 0.0 else prev_gp, prev_gp * gp_up if gp_up > 1.0 else prev_gp)
+                    elif w_gap_ma > w_high:
+                        # Critic too dominant → reduce GP to let generator catch up
+                        lambda_gp_cur = max(gp_min, prev_gp * gp_down)
                     # No upward reversal: once weakened, stay weakened
                     if writer is not None and (prev_cs != int(critic_steps_cur) or abs(prev_gp - float(lambda_gp_cur)) > 1e-12):
                         try:
@@ -916,12 +966,73 @@ def main(args):
                         f"active={active:.0f}MiB inact_split={inact:.0f}MiB free={free:.0f}MiB "
                         f"usage={usage_pct:.1f}%"
                     )
+                # Report max muons per event (primary) seen in this batch
+                try:
+                    max_counts_val = int(counts_cpu.max().item())
+                except Exception:
+                    max_counts_val = -1
+                
+                # Batch composition diagnostics
+                batch_comp_str = (
+                    f"batch_comp: events={num_events} muons={total_muons} "
+                    f"avg={avg_muons_per_event:.1f} max={max_muons_in_batch} "
+                    f"large(>10k)={num_large_events}"
+                )
+
+                # Allocator trim to curb reserved-active gap
+                trim_interval = int(getattr(args, "cuda_empty_cache_interval", 0) or 0)
+                trim_threshold = int(getattr(args, "cuda_empty_cache_threshold_mib", 0) or 0)
+                gap_mib = None
+                if gpu_stats:
+                    try:
+                        reserved = float(gpu_stats.get("reserved_mib", float("nan")))
+                        active_mib = float(gpu_stats.get("active_mib", float("nan")))
+                        if reserved == reserved and active_mib == active_mib:
+                            gap_mib = reserved - active_mib
+                    except Exception:
+                        gap_mib = None
+                should_trim = False
+                if torch.cuda.is_available():
+                    if trim_interval > 0 and train_steps_done > 0 and (train_steps_done % trim_interval) == 0:
+                        should_trim = True
+                    if (not should_trim) and trim_threshold > 0 and gap_mib is not None and gap_mib > float(trim_threshold):
+                        should_trim = True
+                    if should_trim:
+                        try:
+                            torch.cuda.empty_cache()
+                            tqdm.write(
+                                f"[memory] torch.cuda.empty_cache() at step {train_steps_done} "
+                                f"gap={gap_mib if gap_mib is not None else float('nan'):.0f}MiB"
+                            )
+                        except Exception as e:
+                            tqdm.write(f"[memory] empty_cache failed: {e}")
+                
+                # Periodic optimizer state cleanup to prevent accumulation
+                if train_steps_done > 0 and (train_steps_done % 1000) == 0:
+                    try:
+                        # Force optimizer state consolidation by clearing and rebuilding
+                        # Adam stores exp_avg (momentum) and exp_avg_sq (velocity) which grow with param size
+                        # When large batches cause temporary param growth, these buffers persist
+                        for opt in [opt_G, opt_C]:
+                            # Save the param_groups config (lr, betas, etc.)
+                            old_state = {id(p): opt.state[p].copy() if p in opt.state else {} 
+                                        for group in opt.param_groups for p in group['params']}
+                            # Clear all state
+                            opt.state.clear()
+                            # Force CUDA memory release
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        tqdm.write(f"[memory] optimizer state cleared and rebuilt at step {train_steps_done}")
+                    except Exception as e:
+                        tqdm.write(f"[memory] optimizer state cleanup failed: {e}")
+                
                 tqdm.write(
                     f"[global] batches={batches_seen_global} events={events_seen_global} muons={muons_seen_global} "
                     f"c_loss={c_loss:.4f} g_loss={g_loss:.4f} m_loss={m_loss:.4f} w_gap={w_gap:.4f} w_ma={w_gap_ma:.4f} "
-                    f"cs={int(critic_steps_cur)} gp={float(lambda_gp_cur):.4f} "
+                    f"cs={int(critic_steps_cur)} gp={float(lambda_gp_cur):.4f} max_mu_per_ev={max_counts_val} "
                     f"{gpu_str}"
                 )
+                tqdm.write(f"[batch] {batch_comp_str}")
                 
                 # TensorBoard logging
                 if writer is not None:
@@ -930,6 +1041,11 @@ def main(args):
                     writer.add_scalar("train/m_loss", m_loss, train_steps_done)
                     writer.add_scalar("train/w_gap", w_gap, train_steps_done)
                     writer.add_scalar("train/w_gap_ma_500", w_gap_ma, train_steps_done)
+                    writer.add_scalar("data/batch_total_muons", total_muons, train_steps_done)
+                    writer.add_scalar("data/batch_num_events", num_events, train_steps_done)
+                    writer.add_scalar("data/batch_avg_muons_per_event", avg_muons_per_event, train_steps_done)
+                    writer.add_scalar("data/batch_max_muons_in_event", max_muons_in_batch, train_steps_done)
+                    writer.add_scalar("data/batch_num_large_events", num_large_events, train_steps_done)
         
         batch_pbar.close()
         
@@ -1296,7 +1412,7 @@ def main(args):
                     )
                     prof.__enter__()
 
-                c_loss_local, g_loss_local, m_loss_local, w_gap_local = train_step_scalable(
+                c_loss_local, g_loss_local, m_loss_local, w_gap_local, total_fake_muons_local = train_step_scalable(
                     gen,
                     crit,
                     opt_G,
@@ -1311,6 +1427,7 @@ def main(args):
                     gp_sample_fraction=float(getattr(args, "gp_sample_fraction", 0.0) or 0.0),
                     gp_every=int(getattr(args, "gp_every", 1) or 1),
                     grad_clip_norm=float(getattr(args, "grad_clip_norm", 0.0) or 0.0),
+                    grad_accum_steps=int(getattr(args, "grad_accum_steps", 1) or 16),
                     device=device,
                 )
 
@@ -1323,6 +1440,8 @@ def main(args):
                     except Exception as e:
                         tqdm.write(f"[Profile error: {e}]")
                     steps_profiled += 1
+    
+                tqdm.write(f"[Debug] Substep losses: c_loss={c_loss_local:.4f} g_loss={g_loss_local:.4f} m_loss={m_loss_local:.4f} w_gap={w_gap_local:.4f}, total_fake_muons={total_fake_muons_local}, vram_used={vram_used:.4f} GB, vram_peak={vram_peak:.4f} GB")
 
                 return c_loss_local, g_loss_local, m_loss_local, w_gap_local, sub_muons_norm, sub_prims_norm, sub_counts
 
@@ -1499,6 +1618,8 @@ def main(args):
                         max_counts_val = float(counts_cpu.max().item())
                         writer.add_scalar("data/mean_counts", mean_counts_val, train_steps_done)
                         writer.add_scalar("data/max_counts", max_counts_val, train_steps_done)
+                        # Explicit metric for max muons per event (primary) in current batch
+                        writer.add_scalar("data/max_mu_per_event", max_counts_val, train_steps_done)
                     except Exception:
                         pass
 
@@ -1787,8 +1908,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "If >0, split each ragged batch into microbatches so that sum(counts) <= this value. "
-            "Helps prevent GPU OOM when rare batches have extremely many muons (default: 0 disables)."
+            "Primary per-batch muon cap for microbatching. If >0, split each ragged batch into "
+            "substeps so that sum(counts) <= this value. If --preflight-muon-threshold is set, "
+            "it overrides this value. Default: 0 disables."
         ),
     )
     parser.add_argument(
@@ -1798,6 +1920,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "If >0, treat any single event with count > this value as an outlier and skip it (and optionally write it via --outliers-dir). "
             "If 0, the outlier threshold falls back to --max-muons-per-batch. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-muon-threshold",
+        type=int,
+        default=0,
+        help=(
+            "If >0, this becomes the effective per-batch muon cap (used for microbatching). "
+            "Use this as the single knob for splitting oversized batches. Overrides --max-muons-per-batch. "
+            "Default: 0 (fall back to --max-muons-per-batch or unlimited if that is 0)."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-empty-cache-interval",
+        type=int,
+        default=5000,
+        help=(
+            "If >0, call torch.cuda.empty_cache() every N training steps to trim the CUDA allocator. "
+            "Set to 0 to disable periodic trimming. Default: 5000."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-empty-cache-threshold-mib",
+        type=int,
+        default=0,
+        help=(
+            "If >0, call torch.cuda.empty_cache() when (reserved - active) exceeds this many MiB. "
+            "Requires GPU stats to be available. Default: 0 disables threshold-based trimming."
         ),
     )
     parser.add_argument(

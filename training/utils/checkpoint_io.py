@@ -94,7 +94,7 @@ def save_progress(checkpoint_path, epoch: int, processed_files: set[str], fs=Non
             print(f"Warning: Could not save checkpoint to Pelican: {e}")
     else:
         with open(checkpoint_path, 'w') as f:
-            json.dump(payload, f)
+            json.dump(payload, f, indent=2, sort_keys=True)
 
 
 def save_model_checkpoint(path, gen, crit, opt_G, opt_C, epoch=0, fs=None):
