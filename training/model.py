@@ -356,7 +356,7 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
         outputs=d_interpolates,
         inputs=interpolates,
         grad_outputs=fake_labels,
-        create_graph=True, #gemini claims this is required # No second-order derivatives; preserves gradient flow & saves memory
+        create_graph=True,  # Required for gradient penalty to backpropagate correctly
         retain_graph=True,  # Safe to free after grad computation
         only_inputs=True
     )[0]
@@ -424,7 +424,7 @@ def train_step_scalable(
     Returns:
         Tuple of (critic_loss, generator_loss, multiplicity_loss, w_gap) as scalars
     """
-    # GEMINI AGAIN 
+    # Ensure inputs don't carry gradients from previous operations
     real_cond = real_cond.detach() 
     real_muons_flat = real_muons_flat.detach()
 
@@ -436,33 +436,20 @@ def train_step_scalable(
     loss_multiplicity = None
     w_gap_val = 0.0
 
-    # GEMINI
-    # ===== Train Multiplicity Predictor =====
+    # ===== Prepare Multiplicity Target =====
     # Target: log10(real_counts + 1) to match network's output
     if isinstance(real_counts, torch.Tensor):
         real_counts_tensor = real_counts.float().to(device).unsqueeze(1) if real_counts.dim() == 1 else real_counts.to(device)
     else:
         real_counts_tensor = torch.tensor(real_counts, device=device, dtype=torch.float32).unsqueeze(1)
     target_multiplicity = torch.log10(real_counts_tensor + 1)
-    
-    # Gradient accumulation for multiplicity predictor
-    if grad_accum_steps == 1:
-        opt_G.zero_grad()
-    # pred_multiplicity = gen.multiplicity_net(real_cond)
-    # loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
-    # loss_multiplicity_scaled = loss_multiplicity / grad_accum_steps
-    # loss_multiplicity_scaled.backward()
-    if grad_accum_steps == 1:
-        if float(grad_clip_norm) > 0.0:
-            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))
-        opt_G.step()
 
     # ===== Update Critic =====
     for ci in range(int(critic_steps)):
         if grad_accum_steps == 1:
             opt_C.zero_grad()
 
-        # GEMINI SUGGESTION: GENERATE FAKES WITHOUT TRACKING GEN GRADIENTS
+        # Generate fake samples without tracking generator gradients during critic update
         with torch.no_grad():
             # Generate fake samples (generator predicts its own multiplicity)
             fake_muons_flat, fake_batch_idx = gen(real_cond)
@@ -586,9 +573,7 @@ def train_step_scalable(
 
 
 
-        #GEMINI SUGGESTION START
-        # DETACH the fakes for the Critic/GP pass
-        fakes_for_gp = fake_muons_flat.detach().requires_grad_(True)
+        # Note: fake_muons_flat already detached from generator gradient flow above
 
         # Compute Wasserstein loss and gradient penalty on aligned subsets
         gradient_penalty = compute_gp_flat(
@@ -615,30 +600,20 @@ def train_step_scalable(
     if grad_accum_steps == 1:
         opt_G.zero_grad()
 
-    
-# 1. Single Forward Pass
-    # Ensure your Generator returns the predicted multiplicity along with the muons
-    # If it doesn't, we call the multiplicity net as part of the SAME sequence
+    # ===== Update Generator =====
+    # Forward pass: predict multiplicity and generate muons
     pred_multiplicity = gen.multiplicity_net(real_cond) 
     curr_fake_muons, curr_fake_idx = gen(real_cond)
     
-    # 2. Compute both losses
+    # Compute both losses
     loss_multiplicity = nn.functional.mse_loss(pred_multiplicity, target_multiplicity)
-    
     fake_score_G = crit(curr_fake_muons, curr_fake_idx, real_cond, batch_size)
     loss_generator = -fake_score_G.mean()
     
-    # 3. Combined Backward
-    # This is the "Magic" fix: Sum them first, then backward ONCE.
+    # Combined backward: sum losses first, then backward once
+    # This ensures gradients flow correctly through shared parameters
     total_g_loss = (loss_generator + loss_multiplicity) / grad_accum_steps
     total_g_loss.backward()
-    
-    # # Re-evaluate fakes with gradients enabled for generator
-    # fake_score_G = crit(fake_muons_flat, fake_batch_idx, real_cond, batch_size)
-    # loss_generator = -fake_score_G.mean()  # Maximize critic score
-    # loss_generator_scaled = loss_generator / grad_accum_steps
-    
-    # loss_generator_scaled.backward()
     if grad_accum_steps == 1:
         if float(grad_clip_norm) > 0.0:
             torch.nn.utils.clip_grad_norm_(gen.parameters(), float(grad_clip_norm))

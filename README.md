@@ -145,8 +145,33 @@ Implementation reference: [training/model.py](training/model.py)
 ** Same as primary - log10(Muon_PeV)
 ** X, Y - Coordinates around the shower axis divided by 500 m
 
+## Documentation
+
+Detailed technical documentation and development history can be found in the [`docs/`](docs/) directory:
+- [INSTABILITY_ANALYSIS.md](docs/INSTABILITY_ANALYSIS.md) - Analysis of training stability issues and fixes
+- [adaptive_tuning_and_filtering_fixes.md](docs/adaptive_tuning_and_filtering_fixes.md) - Adaptive critic tuning implementation
+- [gradient_accumulation_strategy.md](docs/gradient_accumulation_strategy.md) - Memory optimization via gradient accumulation
+- Conversation summaries - Historical development notes
+
+### Gradient Accumulation
+
+For large batch training on memory-constrained GPUs, use `--grad-accum-steps`:
+
+```bash
+python training/train.py \
+    ... \
+    --grad-accum-steps 2  # Split each batch into 2 sub-batches
+```
+
+This reduces peak VRAM usage by 30-40% at the cost of 15-25% slower training. See [docs/gradient_accumulation_strategy.md](docs/gradient_accumulation_strategy.md) for details.
+
 ## Changelog
 
+- 2026-01-19: Code cleanup and refactoring
+	- Removed debug comments and cruft from model.py and train.py
+	- Added `--grad-accum-steps` CLI argument for gradient accumulation
+	- Added comprehensive docstrings to main training functions
+	- Created reference documentation in docs/ directory
 - 2026-01-09: Major training and performance updates
 	- Added robust Pelican prefetch, GPU monitoring, profiler hooks, and consolidated utilities.
 	- Integrated multiplicity prediction into the generator and stabilized WGAN-GP gradient penalty.
@@ -154,3 +179,4 @@ Implementation reference: [training/model.py](training/model.py)
 	- Removed frequent GPU→CPU syncs, added vectorized GP pairing, and optional profiling.
 	- Result: multi-x throughput improvements with low memory footprint.
 	- Full summary: see [docs/conversation_summary_2026-01-09.md](docs/conversation_summary_2026-01-09.md)
+

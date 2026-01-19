@@ -52,10 +52,31 @@ from dataloader import SingleHDF5Dataset, MultiHDF5Dataset, ragged_collate_fn
 from hf_dataloader import FileBytesLRUCache, get_hf_dataset, get_parquet_batch_dataset, hf_collate_fn
 from normalizer import DataNormalizer
 from model import ScalableGenerator, ScalableCritic, train_step_scalable
+from training_substep import run_training_substep
 
 from torch.utils.data import DataLoader
 
 def main(args):
+    """Main training function for conditional WGAN-GP model.
+    
+    Trains a Wasserstein GAN with Gradient Penalty to learn the mapping from
+    cosmic ray primaries to detector muons in IceCube. Supports streaming from
+    various data sources (HDF5, Parquet, Pelican federation) with advanced features
+    like gradient accumulation, adaptive critic tuning, and multi-file shuffling.
+    
+    Args:
+        args: Argparse namespace containing training configuration. See build_arg_parser()
+              for all available options.
+              
+    Key features:
+        - Wasserstein GAN training with gradient penalty
+        - Streaming data loading from local/remote sources  
+        - Gradient accumulation for memory efficiency
+        - Adaptive critic/GP tuning based on Wasserstein distance
+        - Multi-file shuffling to prevent overfitting
+        - TensorBoard logging with remote sync support
+        - Checkpoint-based resumption
+    """
     # Enable anomaly detection for debugging inplace operation errors
     if bool(getattr(args, "detect_anomaly", False)):
         torch.autograd.set_detect_anomaly(True)
@@ -2392,6 +2413,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
         help=(
             "Apply gradient penalty every N critic steps (default: 2). Set to 1 for every step."
+        ),
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of gradient accumulation steps (default: 1 = disabled). "
+            "When >1, gradients are accumulated over multiple sub-batches before updating weights. "
+            "Reduces peak memory usage at the cost of slower training."
         ),
     )
     parser.add_argument(
