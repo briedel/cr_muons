@@ -211,15 +211,18 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         minor_id = np.uint64(primary.minor_id)
 
         for depth, ts in tracks.items():
+            if len(ts) == 0:
+                continue
+
             self.buf_primary_major_id.append(major_id)
             self.buf_primary_minor_id.append(minor_id)
-
             self.buf_primary.append([
                 float(primary.energy),
                 float(primary.dir.zenith),
                 float(primary.mass),
                 float(depth),
             ])
+            self.buf_muons.append([])
 
             mu_rows = []
             for t in ts:
