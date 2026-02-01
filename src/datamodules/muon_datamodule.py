@@ -22,6 +22,7 @@ class MuonDataModule(pl.LightningDataModule):
                  pin_memory: bool = False,
                  prefetch_factor: int = 2,
                  shuffle_parquet: bool = False,
+                 multi_file_shuffle: int = 0,
                  files_override: list = None,
                  prefetch_ahead: int = 0,
                  prefetch_dir: str = None,
@@ -84,7 +85,8 @@ class MuonDataModule(pl.LightningDataModule):
                         batch_size=self.hparams.batch_size,
                         federation_url=self.hparams.federation_url,
                         token=self.hparams.token,
-                        shuffle=self.hparams.shuffle_parquet
+                        shuffle=self.hparams.shuffle_parquet,
+                        multi_file_shuffle=self.hparams.multi_file_shuffle
                   )
              else:
                  self.train_dataset = get_hf_dataset(

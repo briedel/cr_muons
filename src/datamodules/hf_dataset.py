@@ -323,6 +323,7 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         memory_cache=None,
         shuffle: bool = False,
         shuffle_seed: int = 42,
+        multi_file_shuffle: int = 0,
     ) -> None:
         super().__init__()
         self.file_paths = [str(p) for p in (file_paths or [])]
@@ -332,6 +333,7 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         self.memory_cache = memory_cache
         self.shuffle = bool(shuffle)
         self.shuffle_seed = int(shuffle_seed)
+        self.multi_file_shuffle = int(multi_file_shuffle)
 
     def __iter__(self):
         if pq is None:
@@ -481,59 +483,100 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
                 return
             
             # Concatenate all data
-            concat_flat_muons = torch.cat(all_flat_muons, dim=0) if all_flat_muons else torch.empty((0, 3), dtype=torch.float32)
             concat_all_prims = torch.cat(all_prims, dim=0)
             concat_all_counts = torch.cat(all_counts, dim=0)
             
-            # Create global batch index for all events
-            global_batch_indices = torch.cat([
-                idx + i * concat_all_prims.shape[0] 
-                for i, idx in enumerate(all_batch_idx)
-            ])
+            # Split flat_muons into individual event tensors to keep association
+            if all_flat_muons:
+                concat_flat_muons = torch.cat(all_flat_muons, dim=0)
+                muon_list = torch.split(concat_flat_muons, concat_all_counts.tolist())
+            else:
+                muon_list = [torch.empty((0, 3)) for _ in range(concat_all_prims.shape[0])]
             
             # Generate shuffled permutation
             rng = np.random.RandomState(self.shuffle_seed)
             num_events = concat_all_prims.shape[0]
             perm = rng.permutation(num_events)
             
-            # Shuffle
             perm_tensor = torch.as_tensor(perm, dtype=torch.long)
             shuffled_prims = concat_all_prims[perm_tensor]
             shuffled_counts = concat_all_counts[perm_tensor]
-            
-            # Recreate batch_idx for shuffled data
-            shuffled_batch_idx = torch.repeat_interleave(
-                torch.arange(len(shuffled_counts), dtype=torch.long), 
-                shuffled_counts
-            )
-            
-            # Also shuffle muons correspondingly
-            if concat_flat_muons.numel() > 0:
-                # Need to map muon indices through the permutation
-                # This is complex because muons are flattened by counts
-                # For now, yield muons in their original order but batch them with shuffled primaries
-                # This is a limitation but acceptable as a first test
-                shuffled_flat_muons = concat_flat_muons
-            else:
-                shuffled_flat_muons = concat_flat_muons
+            shuffled_muon_list = [muon_list[i] for i in perm]
             
             # Yield in batches of batch_size
-            for i in range(0, len(shuffled_prims), self.batch_size):
-                batch_end = min(i + self.batch_size, len(shuffled_prims))
+            for i in range(0, num_events, self.batch_size):
+                batch_end = min(i + self.batch_size, num_events)
                 batch_prims = shuffled_prims[i:batch_end]
                 batch_counts = shuffled_counts[i:batch_end]
+                
+                # Combine muons for this batch
+                batch_muons = shuffled_muon_list[i:batch_end]
+                batch_flat_muons = torch.cat(batch_muons, dim=0) if any(m.numel() > 0 for m in batch_muons) else torch.empty((0, 3))
+                
                 batch_batch_idx = torch.repeat_interleave(
                     torch.arange(len(batch_counts), dtype=torch.long),
                     batch_counts
                 )
                 
-                # Get muons for this batch (simplified: use original order)
-                # A more complex implementation would shuffle muons too
-                total_muons_before = int(concat_all_counts[:i].sum().item()) if i > 0 else 0
-                total_muons_in_batch = int(batch_counts.sum().item())
-                batch_flat_muons = shuffled_flat_muons[total_muons_before:total_muons_before + total_muons_in_batch]
-                
                 yield batch_flat_muons, batch_batch_idx, batch_prims, batch_counts
+        elif self.multi_file_shuffle > 0:
+            # Interleave batches from multiple files concurrently
+            num_concurrent = min(self.multi_file_shuffle, len(self.file_paths))
+            
+            # Shuffle initial file list to randomize which files start together
+            rng = np.random.RandomState(self.shuffle_seed)
+            shuffled_paths = list(self.file_paths)
+            rng.shuffle(shuffled_paths)
+            
+            # Use a pool of iterators
+            iterators = []
+            
+            def _get_pf(path):
+                if fs:
+                    if cache_enabled:
+                        def _load_bytes() -> bytes:
+                            with fs.open(path, "rb") as f:
+                                return f.read()
+                        raw = self.memory_cache.get_or_load(path, _load_bytes)
+                        return pq.ParquetFile(io.BytesIO(raw))
+                    else:
+                        return pq.ParquetFile(fs.open(path, "rb"))
+                else:
+                    if cache_enabled:
+                        def _load_bytes() -> bytes:
+                            with open(path, "rb") as f:
+                                return f.read()
+                        raw = self.memory_cache.get_or_load(path, _load_bytes)
+                        return pq.ParquetFile(io.BytesIO(raw))
+                    else:
+                        return pq.ParquetFile(path)
+
+            path_queue = list(shuffled_paths)
+            
+            # Initialize the pool
+            while len(iterators) < num_concurrent and path_queue:
+                p = path_queue.pop(0)
+                try:
+                    pf = _get_pf(p)
+                    iterators.append(_iter_parquet(pf))
+                except Exception as e:
+                    print(f"Error opening {p}: {e}")
+
+            while iterators:
+                # Pick a random iterator from the active pool
+                idx = rng.randint(0, len(iterators))
+                try:
+                    yield next(iterators[idx])
+                except StopIteration:
+                    # File finished, replace with next from queue if available
+                    iterators.pop(idx)
+                    if path_queue:
+                        p = path_queue.pop(0)
+                        try:
+                            pf = _get_pf(p)
+                            iterators.append(_iter_parquet(pf))
+                        except Exception as e:
+                            print(f"Error opening {p}: {e}")
         else:
             # Original non-shuffled iteration
             for path in self.file_paths:
@@ -571,6 +614,7 @@ def get_parquet_batch_dataset(
     memory_cache=None,
     shuffle: bool = False,
     shuffle_seed: int = 42,
+    multi_file_shuffle: int = 0,
 ) -> ParquetBatchIterableDataset:
     return ParquetBatchIterableDataset(
         file_paths,
@@ -580,6 +624,7 @@ def get_parquet_batch_dataset(
         memory_cache=memory_cache,
         shuffle=shuffle,
         shuffle_seed=shuffle_seed,
+        multi_file_shuffle=multi_file_shuffle,
     )
 
 def hf_collate_fn(batch):

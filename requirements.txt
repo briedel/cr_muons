@@ -7,4 +7,6 @@ datasets
 pyarrow
 pelicanfs
 zarr
-wipac-rest-toolspytorch-lightning
+wipac-rest-tools
+pytorch-lightning
+zuko

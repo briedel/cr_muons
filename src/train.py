@@ -25,11 +25,13 @@ def main():
     
     # Dataset Params
     parser.add_argument("--file_format", type=str, default="parquet", choices=["hdf5", "parquet", "hf"], help="Data file format")
-    parser.add_argument("--parquet_batch_reader", action="store_true", help="Use efficient Parquet batch reader")
+    parser.add_argument("--no_parquet_batch_reader", action="store_false", dest="parquet_batch_reader", help="Disable efficient Parquet batch reader")
+    parser.set_defaults(parquet_batch_reader=True)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--shuffle_parquet", action="store_true")
+    parser.add_argument("--multi_file_shuffle", type=int, default=0, help="Number of files to interleave batches from")
     parser.add_argument("--prefetch_batches", type=int, default=0, help="Number of batches to prefetch in background")
     parser.add_argument("--prefetch_ahead", type=int, default=0, help="Number of Pelican files to prefetch ahead")
     parser.add_argument("--prefetch_dir", type=str, default=None, help="Cache directory for Pelican prefetching")
@@ -43,11 +45,17 @@ def main():
     parser.add_argument("--pelican_auth_cache_file", type=str, default="pelican_auth_cache.json")
 
 
-    # GAN specific params
-    parser.add_argument("--cond_dim", type=int, default=4)
-    parser.add_argument("--feat_dim", type=int, default=3)
+    # GAN / Flow shared params
+    parser.add_argument("--cond_dim", type=int, default=5, help="5 features: [E, zenith, mass, time, depth]")
+    parser.add_argument("--feat_dim", type=int, default=4, help="4 features: [E, x, y, time]")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--critic_pooling", type=str, default="amax")
+
+    # Flow specific params
+    parser.add_argument("--flow_bins", type=int, default=10)
+    parser.add_argument("--flow_transforms", type=int, default=3)
+    parser.add_argument("--mult_loss_weight", type=float, default=0.1)
+
     parser.add_argument("--latent_dim_global", type=int, default=32)
     parser.add_argument("--latent_dim_local", type=int, default=16)
     parser.add_argument("--lambda_gp", type=float, default=10.0)
@@ -126,6 +134,7 @@ def main():
         pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor,
         shuffle_parquet=args.shuffle_parquet,
+        multi_file_shuffle=args.multi_file_shuffle,
         federation_url=args.federation_url,
         token=token,
         files_override=files,
@@ -166,10 +175,14 @@ def main():
         model = MuonFlow(
             cond_dim=args.cond_dim,
             feat_dim=args.feat_dim,
+            hidden_dim=args.hidden_dim,
+            bins=args.flow_bins,
+            transforms=args.flow_transforms,
+            mult_loss_weight=args.mult_loss_weight,
             lr=args.lr
         )
         callbacks = [
-            ModelCheckpoint(monitor="train_loss", mode="min", save_last=True),
+            ModelCheckpoint(monitor="val_loss", mode="min", save_last=True),
             LearningRateMonitor(logging_interval="step")
         ]
 
