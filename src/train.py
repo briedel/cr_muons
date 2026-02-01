@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--drop_empty", action="store_true")
     
     # Dataset Params
-    parser.add_argument("--file_format", type=str, default="hdf5", choices=["hdf5", "parquet", "hf"], help="Data file format")
+    parser.add_argument("--file_format", type=str, default="parquet", choices=["hdf5", "parquet", "hf"], help="Data file format")
     parser.add_argument("--parquet_batch_reader", action="store_true", help="Use efficient Parquet batch reader")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", action="store_true")
