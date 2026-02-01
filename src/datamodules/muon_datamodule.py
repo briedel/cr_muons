@@ -1,7 +1,8 @@
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from .hdf5_dataset import MultiHDF5Dataset, ragged_collate_fn
-from .hf_dataset import get_hf_dataset, get_parquet_batch_dataset, hf_collate_fn
+from .hf_dataset import get_hf_dataset, hf_collate_fn
+from .parquet_dataset import get_parquet_batch_dataset
 from ..utils.pelican_utils import expand_pelican_wildcards, PelicanPrefetcher
 from ..utils.data_utils import PrefetchIterator
 import glob
@@ -111,8 +112,16 @@ class MuonDataModule(pl.LightningDataModule):
              kwargs["prefetch_factor"] = self.hparams.prefetch_factor
              kwargs["persistent_workers"] = True
 
+        # Check if using the vectorized parquet batch reader
+        if self.hparams.parquet_batch_reader and self.hparams.file_format == "parquet":
+             # Dataset already yields batches of tensors
+             kwargs["batch_size"] = None
+             loader = DataLoader(
+                self.train_dataset,
+                **kwargs
+             )
         # HDF5
-        if self.hparams.file_format == "hdf5":
+        elif self.hparams.file_format == "hdf5":
              loader = DataLoader(
                 self.train_dataset,
                 collate_fn=ragged_collate_fn,
@@ -120,7 +129,7 @@ class MuonDataModule(pl.LightningDataModule):
                 **kwargs
              )
         else:
-             # Streaming
+             # Streaming (HuggingFace or custom generator)
              loader = DataLoader(
                 self.train_dataset,
                 collate_fn=hf_collate_fn,
