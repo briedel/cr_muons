@@ -8,9 +8,7 @@ from src.callbacks.adaptive_tuning import AdaptiveCriticTuning
 from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback
 from src.utils import expand_pelican_wildcards, fetch_pelican_token_via_helper
 import argparse
-import os
 import time
-import json
 
 def main():
     parser = argparse.ArgumentParser()
@@ -56,6 +54,7 @@ def main():
     parser.add_argument("--flow_transforms", type=int, default=3)
     parser.add_argument("--mult_loss_weight", type=float, default=0.1)
 
+    # GAN specific params
     parser.add_argument("--latent_dim_global", type=int, default=32)
     parser.add_argument("--latent_dim_local", type=int, default=16)
     parser.add_argument("--lambda_gp", type=float, default=10.0)
