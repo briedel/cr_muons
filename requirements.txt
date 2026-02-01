@@ -7,4 +7,4 @@ datasets
 pyarrow
 pelicanfs
 zarr
-wipac-rest-tools
+wipac-rest-toolspytorch-lightning
