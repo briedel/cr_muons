@@ -5,5 +5,4 @@ tensorboard
 datasets
 pyarrow
 pelicanfs
-zarr
 wipac-rest-tools

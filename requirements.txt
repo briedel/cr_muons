@@ -6,7 +6,6 @@ tensorboard
 datasets
 pyarrow
 pelicanfs
-zarr
-wipac-rest-tools
-pytorch-lightning
-zuko
+wipac-rest-tools==1.12.3
+pytorch-lightning==2.6.1
+zuko==1.4.0
