@@ -157,7 +157,6 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         self.AddParameter("mcprimary_key", "xx", "MCPrimary")
         self.AddParameter("outfile", "xx", None)
         self.AddParameter("buffer_size", "xx", 10000)
-        self.AddParameter("remove_empty_tracks", "xx", False)
 
     def Configure(self):
         if pa is None or pq is None:
@@ -165,7 +164,6 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
 
         self.muonitron_key = self.GetParameter("muonitron_output_key")
         self.mcprim_key = self.GetParameter("mcprimary_key")
-        self.remove_empty_tracks = self.GetParameter("remove_empty_tracks")
         self.outfile = self.GetParameter("outfile")
         self.buffer_size = int(self.GetParameter("buffer_size"))
 
@@ -213,18 +211,17 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         minor_id = np.uint64(primary.minor_id)
 
         for depth, ts in tracks.items():
-            if self.remove_empty_tracks and len(ts) == 0:
+            if len(ts) == 0:
                 continue
-
             self.buf_primary_major_id.append(major_id)
             self.buf_primary_minor_id.append(minor_id)
+
             self.buf_primary.append([
                 float(primary.energy),
                 float(primary.dir.zenith),
                 float(primary.mass),
                 float(depth),
             ])
-            self.buf_muons.append([])
 
             mu_rows = []
             for t in ts:
