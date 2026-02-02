@@ -6,7 +6,12 @@ from src.models.gan_module import MuonGAN
 from src.models.flow_module import MuonFlow
 from src.callbacks.adaptive_tuning import AdaptiveCriticTuning
 from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback
-from src.utils import expand_pelican_wildcards, fetch_pelican_token_via_helper
+from src.utils import (
+    expand_pelican_wildcards,
+    fetch_pelican_token_via_helper,
+    infer_scope_path_from_pelican_uri,
+    is_pelican_path,
+)
 import argparse
 import time
 
@@ -39,7 +44,7 @@ def main():
     parser.add_argument("--federation_url", type=str, default=None)
     parser.add_argument("--pelican_scope_path", type=str, default=None)
     parser.add_argument("--pelican_storage_prefix", type=str, default="/icecube")
-    parser.add_argument("--pelican_oidc_url", type=str, default=None)
+    parser.add_argument("--pelican_oidc_url", type=str, default="https://token-issuer.icecube.aq")
     parser.add_argument("--pelican_auth_cache_file", type=str, default="pelican_auth_cache.json")
 
 
@@ -65,6 +70,7 @@ def main():
     parser.add_argument("--gp_max_pairs", type=int, default=4096)
     parser.add_argument("--gp_sample_fraction", type=float, default=0.0)
     parser.add_argument("--max_muons_per_batch", type=int, default=0)
+    parser.add_argument("--preflight_muon_threshold", type=int, default=0, help="Alias/override for max_muons_per_batch")
     parser.add_argument("--max_muons_per_event", type=int, default=0)
     parser.add_argument("--outliers_dir", type=str, default=None)
     
@@ -75,11 +81,16 @@ def main():
     parser.add_argument("--tb_hist_interval", type=int, default=1000)
     parser.add_argument("--tb_max_muons", type=int, default=20000)
     
-    # Checkpointing
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to save checkpoints (deprecated, use pl default)")
+    # Checkpointing / Resume
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to a checkpoint file (.ckpt) to resume from")
+    parser.add_argument("--resume_last", action="store_true", help="Automatically resume from the latest checkpoint in tb_logdir")
     parser.add_argument("--model_checkpoint", type=str, default=None)
 
     args = parser.parse_args()
+
+    # Handle preflight threshold alias
+    if args.preflight_muon_threshold > 0:
+        args.max_muons_per_batch = args.preflight_muon_threshold
 
     pl.seed_everything(42)
 
@@ -89,21 +100,20 @@ def main():
         print("Handling Pelican Token...")
         # Simple logic: if auto_token, try to fetch
         if args.auto_token:
-            from urllib.parse import urlparse
+            scope_path = args.pelican_scope_path
+            if not scope_path and is_pelican_path(args.data_dir):
+                scope_path = infer_scope_path_from_pelican_uri(
+                    args.data_dir,
+                    storage_prefix=args.pelican_storage_prefix
+                )
             
-            scope = args.pelican_scope_path
-            # Infer scope from data_dir if it's a pelican URL
-            if not scope and "pelican://" in args.data_dir:
-                 # pelican://host/path/to/data -> /path/to/data
-                 parsed = urlparse(args.data_dir.replace("pelican://", "http://"))
-                 # This is a hacky parse, assuming utility handles prefixes better
-                 # Using the fallback logic from training/train.py logic would be better if imported
-                 # But let's assume util handles it or default prefix logic works
-                 pass
+            if not scope_path:
+                print("Warning: --auto-token set but no scope path provided or inferred.")
             
+            print(f"Fetching Pelican token for scope: {scope_path}")
             # Using the util function
             token = fetch_pelican_token_via_helper(
-                scope_path=getattr(args, "pelican_scope_path", None), # Util handles inference if None? Need to check.
+                scope_path=scope_path,
                 federation_url=args.federation_url,
                 oidc_url=args.pelican_oidc_url,
                 auth_cache_file=args.pelican_auth_cache_file,
@@ -200,7 +210,20 @@ def main():
         logger=logger
     )
 
-    trainer.fit(model, datamodule=dm)
+    # Resume Logic
+    ckpt_path = args.checkpoint
+    if args.resume_last:
+        import os
+        import glob
+        # Look for checkpoints in the log directory
+        ckpt_search = os.path.join(args.tb_logdir, "**", "checkpoints", "last.ckpt")
+        ckpts = glob.glob(ckpt_search, recursive=True)
+        if ckpts:
+            # Get the most recently modified one
+            ckpt_path = max(ckpts, key=os.path.getmtime)
+            print(f"Auto-resuming from: {ckpt_path}")
+
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
 if __name__ == "__main__":
     main()
