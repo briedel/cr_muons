@@ -51,14 +51,14 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
         # Create Resizable Datasets
         # We don't know total size yet, so we make them resizable (maxshape=None)
         self.dset_prims = self.file_handle.create_dataset("primaries", 
-                                                    shape=(0, 6), 
-                                                    maxshape=(None, 7), dtype='f4', 
-                                                    chunks=(10000, 7))
+                                                    shape=(0, 5), 
+                                                    maxshape=(None, 5), dtype='f4', 
+                                                    chunks=(10000, 5))
         self.dset_muons = self.file_handle.create_dataset("muons", 
-                                                     shape=(0, 5), 
-                                                     maxshape=(None, 6),
+                                                     shape=(0, 4), 
+                                                     maxshape=(None, 4),
                                                      dtype='f4',
-                                                     chunks=(100000, 6))
+                                                     chunks=(100000, 4))
         self.dset_counts = self.file_handle.create_dataset("counts", 
                                                       shape=(0,), 
                                                       maxshape=(None,), 
@@ -79,7 +79,6 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
                     primary.energy, 
                     primary.dir.zenith, 
                     primary.mass, 
-                    primary.time,  
                     d
             ] )
             if len(ts) > 0:
@@ -88,14 +87,13 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
                      primary. minor_id, 
                      t.energy, 
                      t.radius*math.sin(phis[j]), 
-                     t.radius*math.cos(phis[j]), 
-                     t.time] for j, t in enumerate(ts)
+                     t.radius*math.cos(phis[j])] for j, t in enumerate(ts)
                 ] )
                 self.buf_counts.append(len(ts))
             else:
                 self.buf_muons.extend( [ [primary.major_id, 
                                           primary.minor_id, 
-                                          0, 0, 0, 0] ] )
+                                          0, 0, 0] ] )
                 self.buf_counts.append(1)
         if len(self.buf_prim) >= self.buffer_size:
             self._append_datasets()
@@ -125,8 +123,8 @@ class convert_muonitron_hdf5(icetray.I3ConditionalModule):
         new_n = curr_n + len(self.buf_counts)
 
         # Resize
-        self.dset_prims.resize((new_p, 7))
-        self.dset_muons.resize((new_m, 6))
+        self.dset_prims.resize((new_p, 5))
+        self.dset_muons.resize((new_m, 4))
         self.dset_counts.resize((new_n,))
 
         self.dset_prims[curr_p:] = self.buf_prim

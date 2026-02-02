@@ -97,6 +97,8 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         shuffle: bool = False,
         shuffle_seed: int = 42,
         multi_file_shuffle: int = 0,
+        prefetcher=None,
+        original_uris=None,
     ) -> None:
         super().__init__()
         self.file_paths = [str(p) for p in (file_paths or [])]
@@ -107,6 +109,8 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         self.shuffle = bool(shuffle)
         self.shuffle_seed = int(shuffle_seed)
         self.multi_file_shuffle = int(multi_file_shuffle)
+        # Don't store prefetcher - it can't be pickled for multiprocessing
+        # Instead, just handle missing files gracefully
 
     def __iter__(self):
         if pq is None:
@@ -352,30 +356,56 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
                             print(f"Error opening {p}: {e}")
         else:
             # Original non-shuffled iteration
+            import time
+            import os
+            
             for path in self.file_paths:
-                if fs:
-                    if cache_enabled:
-                        def _load_bytes() -> bytes:
-                            with fs.open(path, "rb") as f:
-                                return f.read()
-                        raw = self.memory_cache.get_or_load(path, _load_bytes)
-                        pf = pq.ParquetFile(io.BytesIO(raw))
-                        yield from _iter_parquet(pf)
-                    else:
-                        with fs.open(path, "rb") as f:
-                            pf = pq.ParquetFile(f)
+                # Handle missing files gracefully (they may still be downloading via prefetcher)
+                max_wait_time = 60  # Max 60 seconds per file
+                wait_interval = 0.5
+                waited = 0
+                
+                # Wait for file to exist (if using local paths)
+                if not fs:  # Local filesystem
+                    while not os.path.exists(path) and waited < max_wait_time:
+                        time.sleep(wait_interval)
+                        waited += wait_interval
+                    
+                    if not os.path.exists(path):
+                        # File still doesn't exist after waiting, skip it
+                        continue
+                
+                try:
+                    if fs:
+                        if cache_enabled:
+                            def _load_bytes() -> bytes:
+                                with fs.open(path, "rb") as f:
+                                    return f.read()
+                            raw = self.memory_cache.get_or_load(path, _load_bytes)
+                            pf = pq.ParquetFile(io.BytesIO(raw))
                             yield from _iter_parquet(pf)
-                else:
-                    if cache_enabled:
-                        def _load_bytes() -> bytes:
-                            with open(path, "rb") as f:
-                                return f.read()
-                        raw = self.memory_cache.get_or_load(path, _load_bytes)
-                        pf = pq.ParquetFile(io.BytesIO(raw))
-                        yield from _iter_parquet(pf)
+                        else:
+                            with fs.open(path, "rb") as f:
+                                pf = pq.ParquetFile(f)
+                                yield from _iter_parquet(pf)
                     else:
-                        pf = pq.ParquetFile(path)
-                        yield from _iter_parquet(pf)
+                        if cache_enabled:
+                            def _load_bytes() -> bytes:
+                                with open(path, "rb") as f:
+                                    return f.read()
+                            raw = self.memory_cache.get_or_load(path, _load_bytes)
+                            pf = pq.ParquetFile(io.BytesIO(raw))
+                            yield from _iter_parquet(pf)
+                        else:
+                            pf = pq.ParquetFile(path)
+                            yield from _iter_parquet(pf)
+                except FileNotFoundError:
+                    # File not yet available (still being prefetched), skip for now
+                    continue
+                except Exception as e:
+                    # Log other errors but continue with remaining files
+                    print(f"Error processing {path}: {e}")
+                    continue
 
 
 def get_parquet_batch_dataset(
@@ -388,6 +418,8 @@ def get_parquet_batch_dataset(
     shuffle: bool = False,
     shuffle_seed: int = 42,
     multi_file_shuffle: int = 0,
+    prefetcher=None,
+    original_uris=None,
 ) -> ParquetBatchIterableDataset:
     return ParquetBatchIterableDataset(
         file_paths,
@@ -398,4 +430,6 @@ def get_parquet_batch_dataset(
         shuffle=shuffle,
         shuffle_seed=shuffle_seed,
         multi_file_shuffle=multi_file_shuffle,
+        prefetcher=prefetcher,
+        original_uris=original_uris,
     )

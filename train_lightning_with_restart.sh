@@ -82,7 +82,7 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         --lambda_gp 10.0 \
         --gp_every 2 \
         --gp_max_pairs 4096 \
-        --accelerator cuda \
+        --accelerator mps \
         --devices 1
     )
     
@@ -104,8 +104,11 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         LOG_PREFIX="${RUN_LOG_DIR}/lightning_${RANGE_LOW}_attempt${attempt}_$(date +%Y%m%d-%H%M%S)"
         
         # Set CUDA optimizations and PYTHONPATH to ensure 'src' is discoverable
-        export PYTHONPATH="$PWD"
+        export PYTHONPATH=$PYTHONPATH:"$PWD"
         export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512,expandable_segments:True"
+        CERT_PATH=$(python3 -m certifi)
+        export SSL_CERT_FILE=${CERT_PATH}
+        export REQUESTS_CA_BUNDLE=${CERT_PATH}
         
         # Execute training
         "${TRAIN_CMD[@]}" \

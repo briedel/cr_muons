@@ -43,14 +43,14 @@ def main():
     parser.add_argument("--auto_token", action="store_true", help="Automatically fetch via osg-token-scope")
     parser.add_argument("--federation_url", type=str, default=None)
     parser.add_argument("--pelican_scope_path", type=str, default=None)
-    parser.add_argument("--pelican_storage_prefix", type=str, default="/icecube")
+    parser.add_argument("--pelican_storage_prefix", type=str, default="/icecube/wipac")
     parser.add_argument("--pelican_oidc_url", type=str, default="https://token-issuer.icecube.aq")
     parser.add_argument("--pelican_auth_cache_file", type=str, default="pelican_auth_cache.json")
 
 
     # GAN / Flow shared params
-    parser.add_argument("--cond_dim", type=int, default=5, help="5 features: [E, zenith, mass, time, depth]")
-    parser.add_argument("--feat_dim", type=int, default=4, help="4 features: [E, x, y, time]")
+    parser.add_argument("--cond_dim", type=int, default=4, help="4 features: [E, zenith, mass, depth]")
+    parser.add_argument("--feat_dim", type=int, default=3, help="3 features: [E, x, y]")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--critic_pooling", type=str, default="amax")
 

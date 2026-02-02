@@ -64,6 +64,8 @@ class MuonDataModule(pl.LightningDataModule):
         # 2. Start Pelican Prefetcher if needed
         if self.hparams.prefetch_ahead > 0 and self.hparams.federation_url:
             p_dir = self.hparams.prefetch_dir or tempfile.gettempdir()
+            # Convert to absolute path to avoid issues with DataLoader worker processes
+            p_dir = os.path.abspath(p_dir)
             self.prefetcher = PelicanPrefetcher(
                 self.files,
                 federation_url=self.hparams.federation_url,
@@ -72,8 +74,29 @@ class MuonDataModule(pl.LightningDataModule):
                 ahead=self.hparams.prefetch_ahead
             )
             self.prefetcher.start()
-            # Remap files to local cache paths
+            # Store original URIs and remap files to local cache paths
+            self.original_uris = self.files.copy()
             self.files = [self.prefetcher.local_path(f) for f in self.files]
+            
+            # IMPORTANT: Only use files that actually exist locally
+            # The prefetcher downloads ahead, so we work with what's available
+            # This prevents errors from trying to open files that haven't downloaded yet
+            existing_files = [f for f in self.files if os.path.exists(f)]
+            if not existing_files:
+                # Wait a bit for initial files to download
+                import time
+                print(f"Waiting for prefetcher to download initial files...")
+                for _ in range(30):  # Wait up to 30 seconds
+                    time.sleep(1)
+                    existing_files = [f for f in self.files if os.path.exists(f)]
+                    if existing_files:
+                        break
+            
+            if not existing_files:
+                raise RuntimeError(f"No files downloaded by prefetcher after 30s. Check prefetcher logs.")
+            
+            print(f"Using {len(existing_files)} files (out of {len(self.files)} total)")
+            self.files = existing_files
 
         # 3. Instantiate Dataset
         if self.hparams.file_format == "hdf5":
@@ -81,13 +104,19 @@ class MuonDataModule(pl.LightningDataModule):
         
         elif self.hparams.file_format in ["parquet", "hf"]:
              if self.hparams.parquet_batch_reader and self.hparams.file_format == "parquet":
+                  # If prefetcher is active, files are local and don't need PelicanFS
+                  use_pelican = (self.prefetcher is None)
+                  # Pass original URIs if using prefetcher
+                  original_uris = getattr(self, 'original_uris', None) if self.prefetcher else None
                   self.train_dataset = get_parquet_batch_dataset(
                         self.files if self.files else [self.hparams.data_dir],
                         batch_size=self.hparams.batch_size,
-                        federation_url=self.hparams.federation_url,
-                        token=self.hparams.token,
+                        federation_url=self.hparams.federation_url if use_pelican else None,
+                        token=self.hparams.token if use_pelican else None,
                         shuffle=self.hparams.shuffle_parquet,
-                        multi_file_shuffle=self.hparams.multi_file_shuffle
+                        multi_file_shuffle=self.hparams.multi_file_shuffle,
+                        prefetcher=self.prefetcher,
+                        original_uris=original_uris
                   )
              else:
                  self.train_dataset = get_hf_dataset(
@@ -101,14 +130,37 @@ class MuonDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         if self.train_dataset is None:
             raise ValueError("Dataset not initialized.")
+        
+        # Wait for some files to be downloaded before starting
+        if self.prefetcher:
+            import time
+            import os
+            print(f"Waiting for prefetcher to download initial files...")
+            wait_time = 0
+            min_files = min(self.hparams.prefetch_ahead, 5)  # Wait for at least 5 files
+            while wait_time < 300:  # Max 5 minutes
+                # Check how many files are actually downloaded
+                if hasattr(self, 'files') and self.files:
+                    downloaded = sum(1 for f in self.files if os.path.exists(f))
+                    if downloaded >= min_files:
+                        print(f"✓ {downloaded} files downloaded, starting training")
+                        break
+                time.sleep(2)
+                wait_time += 2
+            else:
+                print(f"Warning: Only {downloaded if 'downloaded' in locals() else 0} files available after {wait_time}s")
+        
+        # Force num_workers=0 when using prefetcher to avoid multiprocessing issues
+        # (prefetcher runs in main process, workers can't access downloaded files)
+        num_workers = 0 if self.prefetcher else self.hparams.num_workers
             
         kwargs = {
             "batch_size": self.hparams.batch_size,
-            "num_workers": self.hparams.num_workers,
+            "num_workers": num_workers,
             "pin_memory": self.hparams.pin_memory,
         }
         
-        if self.hparams.num_workers > 0:
+        if num_workers > 0:
              kwargs["prefetch_factor"] = self.hparams.prefetch_factor
              kwargs["persistent_workers"] = True
 

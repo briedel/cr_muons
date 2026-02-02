@@ -207,6 +207,7 @@ class MuonGAN(pl.LightningModule):
             gp = torch.tensor(0.0, device=device)
             
             if apply_gp:
+                # Compute pairing indices without gradients (this is just bookkeeping)
                 with torch.no_grad():
                     real_counts_ev = torch.bincount(real_batch_idx, minlength=batch_size)
                     fake_counts_ev = torch.bincount(fake_batch_idx, minlength=batch_size)
@@ -252,8 +253,10 @@ class MuonGAN(pl.LightningModule):
 
                         real_sub = real_muons[idx_r]
                         fake_sub = fake_muons_flat.detach()[idx_f]
-                        
-                        gp = compute_gp_flat(self.critic, real_sub, fake_sub, batch_idx_sub, conditions, batch_size)
+                
+                # Now compute GP WITH gradients (outside the no_grad context)
+                if nonzero_events.numel() > 0:
+                    gp = compute_gp_flat(self.critic, real_sub, fake_sub, batch_idx_sub, conditions, batch_size)
 
             c_loss = fake_score.mean() - real_score.mean() + self.lambda_gp * gp
             c_loss_accum = c_loss / self.hparams.grad_accum_steps

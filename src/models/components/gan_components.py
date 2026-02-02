@@ -350,12 +350,17 @@ def compute_gp_flat(critic, real_flat, fake_flat, batch_index, conditions, batch
     if fake_flat.numel() == 0:
         return torch.tensor(0.0, device=device)
     
+    # Ensure inputs don't have gradients (we're computing new gradients for interpolates)
+    real_flat = real_flat.detach()
+    fake_flat = fake_flat.detach()
+    
     # Sample random interpolation weights per event
     alpha = torch.rand(batch_size, 1, device=device)
     alpha_expanded = alpha[batch_index]  # Broadcast to muon level
     
     # Linear interpolation between real and fake samples
-    interpolates = (alpha_expanded * real_flat + (1 - alpha_expanded) * fake_flat).requires_grad_(True)
+    interpolates = alpha_expanded * real_flat + (1 - alpha_expanded) * fake_flat
+    interpolates.requires_grad_(True)
     
     # Score interpolated samples
     d_interpolates = critic(interpolates, batch_index, conditions, batch_size)
