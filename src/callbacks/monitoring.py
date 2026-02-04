@@ -12,6 +12,7 @@ class PerformanceMonitoringCallback(pl.Callback):
         self.last_batch_end_time = None
         self.total_muons = 0
         self.total_events = 0
+        self.total_empty_events = 0
         self.batches_seen = 0
         self.load_time_sum = 0
         self.step_time_sum = 0
@@ -21,6 +22,7 @@ class PerformanceMonitoringCallback(pl.Callback):
         self.last_batch_end_time = self.epoch_start_time
         self.total_muons = 0
         self.total_events = 0
+        self.total_empty_events = 0
         self.batches_seen = 0
         self.load_time_sum = 0
         self.step_time_sum = 0
@@ -40,13 +42,24 @@ class PerformanceMonitoringCallback(pl.Callback):
         self.step_time_sum += step_time
         
         real_muons, _, _, counts = batch
-        self.total_muons += int(counts.sum().item())
-        self.total_events += int(counts.size(0))
+        n_muons = int(counts.sum().item())
+        n_primaries = int(counts.size(0))
+        n_empty = int((counts == 0).sum().item())
+        
+        self.total_muons += n_muons
+        self.total_events += n_primaries
+        self.total_empty_events += n_empty
         self.batches_seen += 1
 
         if self.batches_seen % self.log_interval == 0:
             elapsed = end_time - self.epoch_start_time
             
+            # Print to screen as requested
+            print(f"\n[Batch {trainer.global_step}] Performance Summary:")
+            print(f"  Primaries: {n_primaries} (Total: {self.total_events})")
+            print(f"  Muons:     {n_muons} (Total: {self.total_muons})")
+            print(f"  Empty:     {n_empty} (Total: {self.total_empty_events})")
+
             # Rate metrics
             pl_module.log("perf/batch_per_s", self.batches_seen / max(1e-9, elapsed))
             pl_module.log("perf/events_per_s", self.total_events / max(1e-9, elapsed))
@@ -55,6 +68,7 @@ class PerformanceMonitoringCallback(pl.Callback):
             # Data stats
             pl_module.log("data/events_seen", float(self.total_events))
             pl_module.log("data/muons_seen", float(self.total_muons))
+            pl_module.log("data/empty_events_seen", float(self.total_empty_events))
             pl_module.log("data/mean_muons_per_event", self.total_muons / max(1, self.total_events))
             
             # Per-batch stats (parity with legacy)
@@ -67,13 +81,25 @@ class PerformanceMonitoringCallback(pl.Callback):
 
             # GPU Stats
             if torch.cuda.is_available():
-                stats = torch.cuda.memory_stats()
-                # Conversion to MiB
+                # Allocation stats
                 mib = 1024 * 1024
-                pl_module.log("cuda/alloc_mib", torch.cuda.memory_allocated() / mib)
-                pl_module.log("cuda/reserved_mib", torch.cuda.memory_reserved() / mib)
-                pl_module.log("cuda/max_alloc_mib", torch.cuda.max_memory_allocated() / mib)
-                pl_module.log("cuda/max_reserved_mib", torch.cuda.max_memory_reserved() / mib)
+                alloc = torch.cuda.memory_allocated() / mib
+                res = torch.cuda.memory_reserved() / mib
+                
+                pl_module.log("cuda/alloc_mib", alloc)
+                pl_module.log("cuda/reserved_mib", res)
+                
+                # Full GPU Mem reporting every 1000 batches
+                if (trainer.global_step + 1) % 1000 == 0:
+                    free, total = torch.cuda.mem_get_info()
+                    used = total - free
+                    print(f"\n[Batch {trainer.global_step}] GPU Memory Status:")
+                    print(f"  Total:     {total / mib:.1f} MiB")
+                    print(f"  Free:      {free / mib:.1f} MiB")
+                    print(f"  Used/Avail: {used / mib:.1f} MiB")
+                    
+                    pl_module.log("cuda/total_mib", total / mib)
+                    pl_module.log("cuda/free_mib", free / mib)
                 
                 # Active/Inactive (requires more detailed stats if parity is strict)
                 # But these 4 are the most important ones.

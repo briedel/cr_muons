@@ -14,6 +14,9 @@ from src.utils import (
 )
 import argparse
 import time
+import torch 
+import os
+import glob
 
 def main():
     parser = argparse.ArgumentParser()
@@ -37,7 +40,10 @@ def main():
     parser.add_argument("--multi_file_shuffle", type=int, default=0, help="Number of files to interleave batches from")
     parser.add_argument("--prefetch_batches", type=int, default=0, help="Number of batches to prefetch in background")
     parser.add_argument("--prefetch_ahead", type=int, default=0, help="Number of Pelican files to prefetch ahead")
+    parser.add_argument("--prefetch_concurrency", type=int, default=4, help="Number of concurrent Pelican downloads")
     parser.add_argument("--prefetch_dir", type=str, default=None, help="Cache directory for Pelican prefetching")
+    parser.add_argument("--delete_after_use", action="store_true", help="Delete local files after they have been processed")
+    parser.add_argument("--limit_files_per_epoch", type=int, default=0, help="If > 0, stop each epoch after this many files")
 
     # Pelican / Authtokens
     parser.add_argument("--auto_token", action="store_true", help="Automatically fetch via osg-token-scope")
@@ -84,6 +90,7 @@ def main():
     # Checkpointing / Resume
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to a checkpoint file (.ckpt) to resume from")
     parser.add_argument("--resume_last", action="store_true", help="Automatically resume from the latest checkpoint in tb_logdir")
+    parser.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Save checkpoint every N training steps")
     parser.add_argument("--model_checkpoint", type=str, default=None)
 
     args = parser.parse_args()
@@ -96,30 +103,40 @@ def main():
 
     # Token Logic
     token = None
+    token_scope_path = None
     if args.auto_token or args.federation_url:
         print("Handling Pelican Token...")
         # Simple logic: if auto_token, try to fetch
         if args.auto_token:
-            scope_path = args.pelican_scope_path
-            if not scope_path and is_pelican_path(args.data_dir):
-                scope_path = infer_scope_path_from_pelican_uri(
+            token_scope_path = args.pelican_scope_path
+            if not token_scope_path and is_pelican_path(args.data_dir):
+                token_scope_path = infer_scope_path_from_pelican_uri(
                     args.data_dir,
                     storage_prefix=args.pelican_storage_prefix
                 )
             
-            if not scope_path:
+            if not token_scope_path:
                 print("Warning: --auto-token set but no scope path provided or inferred.")
             
-            print(f"Fetching Pelican token for scope: {scope_path}")
+            print(f"Fetching Pelican token for scope: {token_scope_path}")
             # Using the util function
             token = fetch_pelican_token_via_helper(
-                scope_path=scope_path,
+                scope_path=token_scope_path,
                 federation_url=args.federation_url,
                 oidc_url=args.pelican_oidc_url,
                 auth_cache_file=args.pelican_auth_cache_file,
                 storage_prefix=args.pelican_storage_prefix
             )
             print(f"Token fetched: {'Yes' if token else 'No'}")
+
+    token_refresh_args = None
+    if args.auto_token and token_scope_path:
+        token_refresh_args = {
+            "scope_path": token_scope_path,
+            "oidc_url": args.pelican_oidc_url,
+            "auth_cache_file": args.pelican_auth_cache_file,
+            "storage_prefix": args.pelican_storage_prefix
+        }
 
     # File Expansion
     files = None
@@ -131,6 +148,39 @@ def main():
              args.federation_url = inferred_fed
          print(f"Found {len(files)} files via Pelican.")
     
+
+
+    # Resume Logic - Pre-calculate to extract DataModule state
+    ckpt_path = args.checkpoint
+    initial_processed_files = None
+    if args.resume_last:
+        # Look for checkpoints in the log directory
+        ckpt_search = os.path.join(args.tb_logdir, "**", "checkpoints", "last.ckpt")
+        ckpts = glob.glob(ckpt_search, recursive=True)
+        if ckpts:
+            # Get the most recently modified one
+            ckpt_path = max(ckpts, key=os.path.getmtime)
+            print(f"Auto-resuming from: {ckpt_path}")
+
+    if ckpt_path and os.path.exists(ckpt_path):
+        try:
+            print(f"Peeking into checkpoint {ckpt_path} to restore processed files list...")
+            # Map location cpu to avoid OOM or CUDA init issues just for this
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            if "datamodule_state_dict" in checkpoint:
+                dm_state = checkpoint["datamodule_state_dict"]
+                if "processed_files" in dm_state:
+                    initial_processed_files = dm_state["processed_files"]
+            elif "MuonDataModule" in checkpoint:
+                # Fallback: sometimes Lightning saves it under the class name
+                dm_state = checkpoint["MuonDataModule"]
+                if "processed_files" in dm_state:
+                    initial_processed_files = dm_state["processed_files"]
+            
+            if initial_processed_files:
+                print(f"  -> Found {len(initial_processed_files)} previously processed files to skip.")
+        except Exception as e:
+            print(f"Warning: Failed to peek at checkpoint: {e}")
 
     # DataModule
     dm = MuonDataModule(
@@ -148,8 +198,13 @@ def main():
         token=token,
         files_override=files,
         prefetch_ahead=args.prefetch_ahead,
+        prefetch_concurrency=args.prefetch_concurrency,
         prefetch_dir=args.prefetch_dir,
-        prefetch_batches=args.prefetch_batches
+        prefetch_batches=args.prefetch_batches,
+        delete_after_use=args.delete_after_use,
+        limit_files_per_epoch=args.limit_files_per_epoch,
+        initial_processed_files=initial_processed_files,
+        token_refresh_args=token_refresh_args
     )
 
     # Model
@@ -171,10 +226,11 @@ def main():
             gp_sample_fraction=args.gp_sample_fraction,
             max_muons_per_batch=args.max_muons_per_batch,
             max_muons_per_event=args.max_muons_per_event,
+            drop_empty_events=args.drop_empty,
             outliers_dir=args.outliers_dir
         )
         callbacks = [
-            ModelCheckpoint(filename="{epoch}-{g_loss:.2f}", monitor="g_loss", mode="min", save_last=True),
+            ModelCheckpoint(filename="{epoch}-{g_loss:.2f}", monitor="g_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
             LearningRateMonitor(logging_interval="step"),
             AdaptiveCriticTuning(),
             PerformanceMonitoringCallback(log_interval=args.tb_log_interval),
@@ -191,7 +247,7 @@ def main():
             lr=args.lr
         )
         callbacks = [
-            ModelCheckpoint(monitor="val_loss", mode="min", save_last=True),
+            ModelCheckpoint(monitor="val_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
             LearningRateMonitor(logging_interval="step")
         ]
 
@@ -209,19 +265,6 @@ def main():
         callbacks=callbacks,
         logger=logger
     )
-
-    # Resume Logic
-    ckpt_path = args.checkpoint
-    if args.resume_last:
-        import os
-        import glob
-        # Look for checkpoints in the log directory
-        ckpt_search = os.path.join(args.tb_logdir, "**", "checkpoints", "last.ckpt")
-        ckpts = glob.glob(ckpt_search, recursive=True)
-        if ckpts:
-            # Get the most recently modified one
-            ckpt_path = max(ckpts, key=os.path.getmtime)
-            print(f"Auto-resuming from: {ckpt_path}")
 
     trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 

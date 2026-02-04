@@ -25,6 +25,7 @@ class MuonGAN(pl.LightningModule):
                  gp_sample_fraction=0.0,
                  max_muons_per_batch=0,
                  max_muons_per_event=0,
+                 drop_empty_events=False,
                  outliers_dir=None):
         super().__init__()
         self.save_hyperparameters()
@@ -101,6 +102,32 @@ class MuonGAN(pl.LightningModule):
             
         batch_size = conditions.size(0)
         device = conditions.device
+        counts_cpu = counts.detach().cpu()
+
+        # 1.5 Drop Empty Events (if requested)
+        if self.hparams.drop_empty_events:
+            empty_mask = counts_cpu == 0
+            if empty_mask.any():
+                keep_mask = ~empty_mask
+                keep_events = torch.nonzero(keep_mask).flatten()
+                
+                if keep_events.numel() == 0:
+                    return None
+                    
+                # Index mapping
+                old_to_new = torch.full((counts.numel(),), -1, dtype=torch.long)
+                old_to_new[keep_mask] = torch.arange(keep_events.numel(), dtype=torch.long)
+                
+                # Filter muons
+                mu_keep = keep_mask[real_batch_idx.cpu()]
+                real_muons_feats = real_muons_feats[mu_keep]
+                real_batch_idx = old_to_new[real_batch_idx.cpu()][mu_keep].to(device)
+                
+                # Filter conditions/counts
+                conditions = conditions[keep_mask]
+                counts = counts[keep_mask]
+                batch_size = conditions.size(0)
+                counts_cpu = counts.detach().cpu()
 
         # 2. Outlier Filtering & Writing
         max_muons = self.hparams.max_muons_per_batch

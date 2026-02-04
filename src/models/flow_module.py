@@ -41,6 +41,9 @@ class MuonFlow(pl.LightningModule):
         # counts: [Batch_Size]
         flat_muons, batch_idx, prims, counts = batch
         
+        if prims.numel() == 0:
+            return None
+
         # 1. Flow Loss: -log P(x | cond)
         # Expand conditions to match flat_muons
         expanded_conds = prims[batch_idx]
@@ -63,6 +66,9 @@ class MuonFlow(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         flat_muons, batch_idx, prims, counts = batch
+        if prims.numel() == 0:
+            return None
+            
         expanded_conds = prims[batch_idx]
         flow_log_prob = self.flow(expanded_conds).log_prob(flat_muons)
         flow_loss = -flow_log_prob.mean()

@@ -9,6 +9,8 @@ import sys
 import tempfile
 import threading
 import time
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -148,6 +150,8 @@ class PelicanPrefetcher:
         token: str | None,
         cache_dir: str,
         ahead: int,
+        concurrency: int = 4,
+        token_factory=None,
     ) -> None:
         self.pelican_uris = [str(u) for u in pelican_uris]
         self.uri_to_index = {u: i for i, u in enumerate(self.pelican_uris)}
@@ -155,8 +159,12 @@ class PelicanPrefetcher:
         self.token = token
         self.cache_dir = str(cache_dir)
         self.ahead = max(0, int(ahead))
+        self.concurrency = max(1, int(concurrency))
+        self.token_factory = token_factory
+        self._token_lock = threading.Lock()
 
         self._current_index = -1
+        self._current_index_shared = multiprocessing.Value('i', -1)
         self._next_download = 0
         self._stop = False
         self._status: dict[str, str] = {u: "pending" for u in self.pelican_uris}
@@ -164,6 +172,7 @@ class PelicanPrefetcher:
 
         self._cond = threading.Condition()
         self._thread = threading.Thread(target=self._run, name="pelican-prefetch", daemon=True)
+        self._executor = None
 
     def start(self) -> None:
         if self.pelican_uris:
@@ -183,6 +192,8 @@ class PelicanPrefetcher:
         with self._cond:
             if idx > self._current_index:
                 self._current_index = idx
+                with self._current_index_shared.get_lock():
+                    self._current_index_shared.value = idx
                 self._cond.notify_all()
 
     def local_path(self, uri: str) -> str:
@@ -236,59 +247,90 @@ class PelicanPrefetcher:
                 self._cond.notify_all()
             return
 
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        fs = PelicanFileSystem(self.federation_url, headers=headers)
+        self._executor = ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="prefetch-worker")
 
-        while True:
-            with self._cond:
-                if self._stop:
-                    return
-
-                target = min(len(self.pelican_uris), self._current_index + self.ahead + 1)
-                if self._next_download >= target:
-                    self._cond.wait(timeout=0.5)
-                    continue
-
-                uri = self.pelican_uris[self._next_download]
-                self._next_download += 1
-
-                # Mark as downloading.
-                self._status[uri] = "downloading"
-                self._cond.notify_all()
-
-            out_path = self.local_path(uri)
-            out_dir = os.path.dirname(out_path)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-
+        def _do_download(uri: str, out_path: str) -> None:
             def _download_one() -> None:
+                # Check again if already done by another process (DDP)
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return
 
-                tmp_path = out_path + ".tmp"
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
+                out_dir = os.path.dirname(out_path)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                
+                # Dynamic token resolution
+                token_to_use = self.token
+                if self.token_factory:
+                    try:
+                        with self._token_lock:
+                            # This call should be fast (cached) in the helper usually
+                            refreshed = self.token_factory()
+                            if refreshed:
+                                token_to_use = refreshed
+                    except Exception as e:
+                         # Log but continue with old token if possible
+                        print(f"Warning: Prefetcher token refresh failed: {e}")
 
-                with fs.open(uri, "rb") as src, open(tmp_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
-                os.replace(tmp_path, out_path)
+                headers = {"Authorization": f"Bearer {token_to_use}"} if token_to_use else {}
+
+                tmp_path = f"{out_path}.{random.getrandbits(32)}.tmp"
+                try:
+                    # Create a fresh FS instance per download to avoid fsspec thread-safety issues
+                    # (fixes 'ValueError: list.remove(x): x not in list' during concurrent reads)
+                    fs_local = PelicanFileSystem(self.federation_url, headers=headers)
+                    with fs_local.open(uri, "rb") as src, open(tmp_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
+                    os.replace(tmp_path, out_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except:
+                            pass
 
             try:
-                retry_with_backoff(
-                    _download_one,
-                    what=f"background prefetch download {uri}",
-                )
+                retry_with_backoff(_download_one, what=f"prefetch {uri}")
                 with self._cond:
                     self._status[uri] = "done"
                     self._cond.notify_all()
             except Exception as e:
                 with self._cond:
                     self._status[uri] = "error"
-                    self._errors[uri] = repr(e)
+                    self._errors[uri] = str(e)
                     self._cond.notify_all()
+
+        while True:
+            with self._cond:
+                # Update local index from shared value (updates from workers)
+                with self._current_index_shared.get_lock():
+                    if self._current_index_shared.value > self._current_index:
+                        self._current_index = self._current_index_shared.value
+
+                if self._stop:
+                    if self._executor:
+                        self._executor.shutdown(wait=False)
+                    return
+
+                target = min(len(self.pelican_uris), self._current_index + self.ahead + 1)
+                
+                # Check for files to dispatch
+                while self._next_download < target:
+                    uri = self.pelican_uris[self._next_download]
+                    out_path = self.local_path(uri)
+                    
+                    # Skip if already being handled or done
+                    if self._status[uri] != "pending":
+                        self._next_download += 1
+                        continue
+                    
+                    # Mark as downloading and dispatch
+                    self._status[uri] = "downloading"
+                    self._executor.submit(_do_download, uri, out_path)
+                    self._next_download += 1
+                
+                # Wait for next update or finished download
+                self._cond.wait(timeout=0.5)
 
 
 def pelican_uri_dir_and_pattern(pelican_uri: str) -> tuple[str, str]:
