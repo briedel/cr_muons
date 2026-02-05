@@ -37,9 +37,9 @@ if [ "$RANGES_TO_PROCESS" -gt 0 ]; then
     TARGET_END=$(( CURRENT_RANGE + RANGE_STEP * (RANGES_TO_PROCESS - 1) ))
     if [ "$TARGET_END" -lt "$RANGE_END" ]; then RANGE_END=$TARGET_END; fi
 fi
+echo "Start time:    $(date)" | tee -a "$ERROR_LOG"
 
 echo "=== Lightning Training Launcher with Auto-Restart ===" | tee -a "$ERROR_LOG"
-echo "Start time:    $(date)" | tee -a "$ERROR_LOG"
 echo "Range:         ${RANGE_START} to ${RANGE_END} (step: ${RANGE_STEP})" | tee -a "$ERROR_LOG"
 echo "Target script: src/train.py" | tee -a "$ERROR_LOG"
 echo "" | tee -a "$ERROR_LOG"
@@ -49,7 +49,7 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
     RANGE_LOW=$(printf "%07d" $CURRENT_RANGE)
     RANGE_HIGH=$(printf "%07d" $((CURRENT_RANGE + RANGE_STEP - 1)))
     RANGE_DIR="${RANGE_LOW}-${RANGE_HIGH}"
-    
+    # testdata/icecube/wipac/data/sim/IceCube/2025/testing/0000000-0000999
     echo "[$(date)] 📁 Processing range: $RANGE_DIR" | tee -a "$ERROR_LOG"
     
     # Build training command for Lightning
@@ -60,17 +60,22 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         --model_type gan \
         --data_dir "pelican://osg-htc.org/icecube/wipac/data/sim/IceCube/2025/testing/${RANGE_DIR}/*.parquet" \
         --file_format parquet \
-        --batch_size 128000 \
+        --batch_size 64000 \
         --num_workers 4 \
-        --prefetch_factor 4 \
         --pin_memory \
-        --multi_file_shuffle 10 \
+        --multi_file_shuffle 8 \
+        # --shuffle_parquet \
         --prefetch_batches 100 \
-        --prefetch_ahead 20 \
+        --prefetch_ahead 50 \
+        --prefetch_concurrency 8 \
         --prefetch_dir "./testdata/" \
+        --delete_after_use \
+        --limit_files_per_epoch 0 \
+        --max_epochs 1 \
         --auto_token \
         --resume_last \
-        --max_muons_per_event 50000 \
+        --checkpoint_every_n_steps 250 \
+        --max_muons_per_event 300000 \
         --preflight_muon_threshold 300000 \
         --max_muons_per_batch 0 \
         --outliers_dir "./outliers_parquet/" \
@@ -82,8 +87,10 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         --lambda_gp 10.0 \
         --gp_every 2 \
         --gp_max_pairs 4096 \
-        --accelerator mps \
-        --devices 1
+        --accelerator cuda \
+        --devices 1 \
+        --drop_empty 
+
     )
     
     attempt=0

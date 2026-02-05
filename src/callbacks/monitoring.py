@@ -2,11 +2,13 @@ import pytorch_lightning as pl
 import torch
 import time
 import os
+import subprocess
 
 class PerformanceMonitoringCallback(pl.Callback):
-    def __init__(self, log_interval=10):
+    def __init__(self, log_interval=10, cleanup_interval=5000):
         super().__init__()
         self.log_interval = log_interval
+        self.cleanup_interval = cleanup_interval
         self.epoch_start_time = None
         self.batch_start_time = None
         self.last_batch_end_time = None
@@ -17,6 +19,19 @@ class PerformanceMonitoringCallback(pl.Callback):
         self.load_time_sum = 0
         self.step_time_sum = 0
 
+    def _get_gpu_utilization(self):
+        try:
+            # Run nvidia-smi command to get utilization
+            result = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
+                encoding='utf-8'
+            )
+            # Parse the output (assumes single GPU or takes the first one)
+            utilization = int(result.strip().split('\n')[0])
+            return utilization
+        except Exception:
+            return 0
+
     def on_train_epoch_start(self, trainer, pl_module):
         self.epoch_start_time = time.perf_counter()
         self.last_batch_end_time = self.epoch_start_time
@@ -26,6 +41,10 @@ class PerformanceMonitoringCallback(pl.Callback):
         self.batches_seen = 0
         self.load_time_sum = 0
         self.step_time_sum = 0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         curr_time = time.perf_counter()
@@ -60,6 +79,16 @@ class PerformanceMonitoringCallback(pl.Callback):
             print(f"  Muons:     {n_muons} (Total: {self.total_muons})")
             print(f"  Empty:     {n_empty} (Total: {self.total_empty_events})")
 
+            # GPU VRAM (Allocated)
+            gpu_util = self._get_gpu_utilization()
+            if torch.cuda.is_available():
+                mib = 1024 * 1024
+                alloc = torch.cuda.memory_allocated() / mib
+                res = torch.cuda.memory_reserved() / mib
+                print(f"  VRAM:      {alloc:.1f} MiB (Reserved: {res:.1f} MiB)")
+                print(f"  GPU Util:  {gpu_util}%")
+                pl_module.log("cuda/gpu_util", float(gpu_util))
+
             # Rate metrics
             pl_module.log("perf/batch_per_s", self.batches_seen / max(1e-9, elapsed))
             pl_module.log("perf/events_per_s", self.total_events / max(1e-9, elapsed))
@@ -78,6 +107,13 @@ class PerformanceMonitoringCallback(pl.Callback):
             # Timing
             pl_module.log("perf/avg_step_ms", (self.step_time_sum / self.batches_seen) * 1000)
             pl_module.log("perf/avg_load_ms", (self.load_time_sum / self.batches_seen) * 1000)
+
+        # Explicit Cleanup
+        if self.batches_seen % self.cleanup_interval == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
             # GPU Stats
             if torch.cuda.is_available():

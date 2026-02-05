@@ -6,9 +6,12 @@ from torch.distributions import Distribution
 
 class MuonFlow(pl.LightningModule):
     def __init__(self, cond_dim=4, feat_dim=3, hidden_dim=256, 
-                 bins=10, transforms=3, mult_loss_weight=0.1, lr=1e-4):
+                 bins=10, transforms=3, mult_loss_weight=0.1, lr=1e-4,
+                 chunk_size=4096):
         super().__init__()
         self.save_hyperparameters()
+        self.chunk_size = chunk_size if chunk_size > 0 else 4096
+        print(f"Using chunk size: {self.chunk_size}")
         
         # 1. Multiplicity Network: P(N | cond)
         # Predicts log(N+1) to handle large ranges and zero-counts
@@ -29,9 +32,35 @@ class MuonFlow(pl.LightningModule):
             hidden_features=[hidden_dim] * 2
         )
         
-    def log_prob(self, x, conditions):
-        """Returns log_prob of muons x given conditions."""
-        return self.flow(conditions).log_prob(x)
+    def log_prob(self, x, conditions, chunk_size=None):
+        """Returns log_prob of muons x given conditions, with optional chunking/checkpointing."""
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+
+        total = x.shape[0]
+        if total <= chunk_size:
+            return self._forward_log_prob(x, conditions)
+        
+        # Chunking loop
+        log_prob_list = []
+        for i in range(0, total, chunk_size):
+            end = min(i + chunk_size, total)
+            x_chunk = x[i:end]
+            c_chunk = conditions[i:end]
+            
+            if self.training and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                # using use_reentrant=False is recommended for newer PyTorch versions
+                log_p = checkpoint(self._forward_log_prob, x_chunk, c_chunk, use_reentrant=False)
+            else:
+                log_p = self._forward_log_prob(x_chunk, c_chunk)
+            
+            log_prob_list.append(log_p)
+            
+        return torch.cat(log_prob_list)
+
+    def _forward_log_prob(self, x, c):
+        return self.flow(c).log_prob(x)
 
     def training_step(self, batch, batch_idx):
         # batch structure from hdf5_dataset.py ragged_collate_fn:
@@ -47,7 +76,7 @@ class MuonFlow(pl.LightningModule):
         # 1. Flow Loss: -log P(x | cond)
         # Expand conditions to match flat_muons
         expanded_conds = prims[batch_idx]
-        flow_log_prob = self.flow(expanded_conds).log_prob(flat_muons)
+        flow_log_prob = self.log_prob(flat_muons, expanded_conds)
         flow_loss = -flow_log_prob.mean()
         
         # 2. Multiplicity Loss: MSE on log(N+1)
@@ -70,7 +99,7 @@ class MuonFlow(pl.LightningModule):
             return None
             
         expanded_conds = prims[batch_idx]
-        flow_log_prob = self.flow(expanded_conds).log_prob(flat_muons)
+        flow_log_prob = self.log_prob(flat_muons, expanded_conds)
         flow_loss = -flow_log_prob.mean()
         
         pred_log_counts = self.multiplicity_net(prims).squeeze(-1)

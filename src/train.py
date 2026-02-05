@@ -244,11 +244,13 @@ def main():
             bins=args.flow_bins,
             transforms=args.flow_transforms,
             mult_loss_weight=args.mult_loss_weight,
-            lr=args.lr
+            lr=args.lr,
+            chunk_size=args.max_muons_per_batch
         )
         callbacks = [
-            ModelCheckpoint(monitor="val_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
-            LearningRateMonitor(logging_interval="step")
+            ModelCheckpoint(filename="{epoch}-{step}-{train_loss:.2f}", monitor="train_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
+            LearningRateMonitor(logging_interval="step"),
+            PerformanceMonitoringCallback(log_interval=args.tb_log_interval)
         ]
 
     # Trainer
