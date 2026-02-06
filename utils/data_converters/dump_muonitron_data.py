@@ -157,6 +157,7 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         self.AddParameter("mcprimary_key", "xx", "MCPrimary")
         self.AddParameter("outfile", "xx", None)
         self.AddParameter("buffer_size", "xx", 10000)
+        self.AddParameter("remove_empty_primaries", "remove primaries without muons at detector", True)
 
     def Configure(self):
         if pa is None or pq is None:
@@ -166,6 +167,7 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         self.mcprim_key = self.GetParameter("mcprimary_key")
         self.outfile = self.GetParameter("outfile")
         self.buffer_size = int(self.GetParameter("buffer_size"))
+        self.remove_empty_prim = self.GetParameter("remove_empty_primaries")
 
         if not self.outfile:
             raise ValueError("outfile must be provided")
@@ -186,8 +188,8 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
             os.makedirs(outdir, exist_ok=True)
 
         self.schema = pa.schema([
-            ("primary_major_id", pa.uint64()),
-            ("primary_minor_id", pa.uint64()),
+            # ("primary_major_id", pa.uint64()),
+            # ("primary_minor_id", pa.uint64()),
             ("primary", pa.list_(pa.float32())),
             ("muons", pa.list_(pa.list_(pa.float32())))
         ])
@@ -196,8 +198,8 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         except Exception as e:
             raise RuntimeError(f"Failed to open Parquet outfile for writing: {self.outfile}: {e}") from e
 
-        self.buf_primary_major_id = []
-        self.buf_primary_minor_id = []
+        # self.buf_primary_major_id = []
+        # self.buf_primary_minor_id = []
         self.buf_primary = []
         self.buf_muons = []
 
@@ -211,10 +213,10 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
         minor_id = np.uint64(primary.minor_id)
 
         for depth, ts in tracks.items():
-            if len(ts) == 0:
+            if len(ts) == 0 and self.remove_empty_prim:
                 continue
-            self.buf_primary_major_id.append(major_id)
-            self.buf_primary_minor_id.append(minor_id)
+            # self.buf_primary_major_id.append(major_id)
+            # self.buf_primary_minor_id.append(minor_id)
 
             self.buf_primary.append([
                 float(primary.energy),
@@ -228,6 +230,7 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
                 phi = random.uniform(0, 2 * math.pi)
                 mu_rows.append([
                     float(t.energy),
+                    float(t.radius),
                     float(t.radius * math.sin(phi)),
                     float(t.radius * math.cos(phi)),
                 ])
@@ -247,16 +250,16 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
 
         table = pa.Table.from_pydict(
             {
-                "primary_major_id": self.buf_primary_major_id,
-                "primary_minor_id": self.buf_primary_minor_id,
+                # "primary_major_id": self.buf_primary_major_id,
+                # "primary_minor_id": self.buf_primary_minor_id,
                 "primary": self.buf_primary,
                 "muons": self.buf_muons,
             },
             schema=self.schema,
         )
         self.writer.write_table(table)
-        self.buf_primary_major_id = []
-        self.buf_primary_minor_id = []
+        # self.buf_primary_major_id = []
+        # self.buf_primary_minor_id = []
         self.buf_primary = []
         self.buf_muons = []
 
@@ -329,7 +332,7 @@ def icetray_script(argsparse):
                   Depths=list(np.linspace(argsparse.mindepth, argsparse.maxdepth, argsparse.depthsteps)*I3Units.km),
                   Propagator=MuonPropagator("ice", ecut=-1, vcut=5e-2, rho=1.005),
                   Crust=crust,
-                  MCTreeName="I3MCTree_preMuonProp")
+                  MCTreeName="I3MCTree_preSampling")
 
 #    tray.AddModule(convert_muonitron_jsonl,
 #                   outfile=argsparse.outfile)
