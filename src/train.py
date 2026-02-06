@@ -5,7 +5,7 @@ from src.datamodules.muon_datamodule import MuonDataModule
 from src.models.gan_module import MuonGAN
 from src.models.flow_module import MuonFlow
 from src.callbacks.adaptive_tuning import AdaptiveCriticTuning
-from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback
+from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback, PhysicalCorrectnessCallback
 from src.utils import (
     expand_pelican_wildcards,
     fetch_pelican_token_via_helper,
@@ -86,12 +86,14 @@ def main():
     parser.add_argument("--tb_log_interval", type=int, default=10)
     parser.add_argument("--tb_hist_interval", type=int, default=1000)
     parser.add_argument("--tb_max_muons", type=int, default=20000)
+    parser.add_argument("--physics_check_interval", type=int, default=100, help="Check physical correctness every N steps")
     
     # Checkpointing / Resume
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to a checkpoint file (.ckpt) to resume from")
     parser.add_argument("--resume_last", action="store_true", help="Automatically resume from the latest checkpoint in tb_logdir")
     parser.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Save checkpoint every N training steps")
     parser.add_argument("--model_checkpoint", type=str, default=None)
+    parser.add_argument("--debug", action="store_true", help="Enable debug prints for normalization")
 
     args = parser.parse_args()
 
@@ -245,12 +247,14 @@ def main():
             transforms=args.flow_transforms,
             mult_loss_weight=args.mult_loss_weight,
             lr=args.lr,
-            chunk_size=args.max_muons_per_batch
+            chunk_size=args.max_muons_per_batch,
+            debug=args.debug
         )
         callbacks = [
             ModelCheckpoint(filename="{epoch}-{step}-{train_loss:.2f}", monitor="train_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
             LearningRateMonitor(logging_interval="step"),
-            PerformanceMonitoringCallback(log_interval=args.tb_log_interval)
+            PerformanceMonitoringCallback(log_interval=args.tb_log_interval),
+            PhysicalCorrectnessCallback(log_every_n_steps=args.physics_check_interval)
         ]
 
     # Trainer

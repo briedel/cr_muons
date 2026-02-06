@@ -34,7 +34,7 @@ class DataNormalizer:
 
         return torch.stack([log_E, cos_Z, log_A, depth], dim=1)
 
-    def normalize_features(self, features):
+    def normalize_features_xy(self, features):
         """
         Input: [Batch, 3] -> [E_mu_GeV, X_m, Y_m]
         Output: [log10(E/1e6), X/500, Y/500]
@@ -47,6 +47,19 @@ class DataNormalizer:
         Y = features[:, 2] / 500.
 
         return torch.stack([log_E, X, Y], dim=1)
+    
+    def normalize_features_r(self, features):
+        """
+        Input: [Batch, 3] -> [E_mu_GeV, R_m]
+        Output: [log10(E/1e6), R/1000]
+        """
+        # 1. Physics Transform
+        # Normalize muon energy to log PeV energy
+        log_E = torch.log10(features[:, 0]/1e6 + 1e-10)
+        # Normalize to a radius of 1000 m around the shower axis
+        R = features[:, 1] / 1000.
+
+        return torch.stack([log_E, R], dim=1)
 
     def denormalize_features(self, features_norm):
         """

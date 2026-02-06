@@ -7,10 +7,13 @@ from torch.distributions import Distribution
 class MuonFlow(pl.LightningModule):
     def __init__(self, cond_dim=4, feat_dim=3, hidden_dim=256, 
                  bins=10, transforms=3, mult_loss_weight=0.1, lr=1e-4,
-                 chunk_size=4096):
+                 chunk_size=4096, debug=False):
         super().__init__()
         self.save_hyperparameters()
         self.chunk_size = chunk_size if chunk_size > 0 else 4096
+        self.debug = debug
+        if self.debug:
+            print("DEBUG: Normalization debugging enabled.")
         print(f"Using chunk size: {self.chunk_size}")
         
         # 1. Multiplicity Network: P(N | cond)
@@ -73,14 +76,35 @@ class MuonFlow(pl.LightningModule):
         if prims.numel() == 0:
             return None
 
+        # Apply Normalization
+        conditions = self.normalizer.normalize_primaries(prims)
+        
+        if self.debug and batch_idx == 0:
+            print("\n" + "="*50)
+            print("[DEBUG] Normalization Check (First 10 Primaries):")
+            print("Index | Raw (E, Z, A, ...) | Normalized (logE, cosZ, logA)")
+            for i in range(min(10, prims.shape[0])):
+                raw_str = ", ".join([f"{x:.2e}" for x in prims[i].tolist()])
+                norm_str = ", ".join([f"{x:.4f}" for x in conditions[i].tolist()])
+                print(f"{i:4d}  | [{raw_str}] | [{norm_str}]")
+            print("="*50 + "\n")
+
+        # Check against typical shapes handled by dataloader/normalizer
+        if flat_muons.shape[1] == 5 and self.hparams.feat_dim == 3:
+             muons_raw = flat_muons[:, 2:]
+        else:
+             muons_raw = flat_muons
+             
+        muons_norm = self.normalizer.normalize_features(muons_raw)
+
         # 1. Flow Loss: -log P(x | cond)
         # Expand conditions to match flat_muons
-        expanded_conds = prims[batch_idx]
-        flow_log_prob = self.log_prob(flat_muons, expanded_conds)
+        expanded_conds = conditions[batch_idx]
+        flow_log_prob = self.log_prob(muons_norm, expanded_conds)
         flow_loss = -flow_log_prob.mean()
         
         # 2. Multiplicity Loss: MSE on log(N+1)
-        pred_log_counts = self.multiplicity_net(prims).squeeze(-1)
+        pred_log_counts = self.multiplicity_net(conditions).squeeze(-1)
         target_log_counts = torch.log1p(counts.float())
         multiplicity_loss = nn.functional.mse_loss(pred_log_counts, target_log_counts)
         
@@ -97,12 +121,22 @@ class MuonFlow(pl.LightningModule):
         flat_muons, batch_idx, prims, counts = batch
         if prims.numel() == 0:
             return None
+
+        # Apply Normalization
+        conditions = self.normalizer.normalize_primaries(prims)
+        
+        if flat_muons.shape[1] == 5 and self.hparams.feat_dim == 3:
+             muons_raw = flat_muons[:, 2:]
+        else:
+             muons_raw = flat_muons
+             
+        muons_norm = self.normalizer.normalize_features(muons_raw)
             
-        expanded_conds = prims[batch_idx]
-        flow_log_prob = self.log_prob(flat_muons, expanded_conds)
+        expanded_conds = conditions[batch_idx]
+        flow_log_prob = self.log_prob(muons_norm, expanded_conds)
         flow_loss = -flow_log_prob.mean()
         
-        pred_log_counts = self.multiplicity_net(prims).squeeze(-1)
+        pred_log_counts = self.multiplicity_net(conditions).squeeze(-1)
         target_log_counts = torch.log1p(counts.float())
         multiplicity_loss = nn.functional.mse_loss(pred_log_counts, target_log_counts)
         
@@ -117,8 +151,11 @@ class MuonFlow(pl.LightningModule):
         else:
             prims = batch
             
+        # Normalize conditions
+        conditions = self.normalizer.normalize_primaries(prims)
+
         # 1. Sample Multiplicity
-        pred_log_counts = self.multiplicity_net(prims).squeeze(-1)
+        pred_log_counts = self.multiplicity_net(conditions).squeeze(-1)
         pred_counts = torch.expm1(pred_log_counts).round().long()
         pred_counts = torch.clamp(pred_counts, min=0)
         
@@ -127,8 +164,12 @@ class MuonFlow(pl.LightningModule):
         for i, count in enumerate(pred_counts):
             if count > 0:
                 # flow(context).sample((n,))
-                samples = self.flow(prims[i:i+1]).sample((count,)).squeeze(1)
-                all_samples.append(samples)
+                # Samples are in normalized space
+                samples_norm = self.flow(conditions[i:i+1]).sample((count,)).squeeze(1)
+                
+                # Denormalize
+                samples_phys = self.normalizer.denormalize_features(samples_norm)
+                all_samples.append(samples_phys)
             else:
                 all_samples.append(torch.zeros((0, self.hparams.feat_dim), device=self.device))
                 

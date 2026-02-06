@@ -178,3 +178,72 @@ class HistogramLoggingCallback(pl.Callback):
             trainer.logger.experiment.add_histogram(
                 "data/counts", counts.detach().cpu().float(), trainer.global_step
             )
+
+class PhysicalCorrectnessCallback(pl.Callback):
+    def __init__(self, log_every_n_steps=1000, max_check_size=200):
+        super().__init__()
+        self.log_every_n_steps = log_every_n_steps
+        self.max_check_size = max_check_size
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if (trainer.global_step + 1) % self.log_every_n_steps != 0:
+            return
+
+        # Try to execute predict_step to generate samples
+        # batch has [flat_muons, batch_idx, prims, counts]
+        _, _, prims, _ = batch
+        
+        # Limit size for speed
+        if prims.shape[0] > self.max_check_size:
+            prims_sub = prims[:self.max_check_size]
+        else:
+            prims_sub = prims
+            
+        with torch.no_grad():
+            try:
+                # Use predict_step from module if available
+                if hasattr(pl_module, 'predict_step'):
+                    # MuonFlow has predict_step which returns DENORMALIZED (Physical) samples now.
+                    # We pass the full batch tuple or just prims. 
+                    # Flow predict_step handles tuple or tensor.
+                    generated_samples = pl_module.predict_step(prims_sub, batch_idx=None)
+                else:
+                    return
+
+                total_violations_energy = 0
+                total_violations_neg = 0
+                total_muons = 0
+                
+                # Iterate over samples
+                for i, muons in enumerate(generated_samples):
+                    if muons.shape[0] == 0:
+                        continue
+                        
+                    # muons is [N, feat_dim]. feat_dim=3 usually (E, x, y)
+                    # prims_sub[i] is [cond_dim]. cond_dim=4 usually (E, zenith, mass, depth)
+                    
+                    e_mu = muons[:, 0] # GeV
+                    e_prim = prims_sub[i, 0] # GeV (Raw)
+                    
+                    # 1. Energy Conservation: E_mu <= E_prim
+                    # We allow small tolerance for numerical noise if near boundary, but generally strictly enforced.
+                    # Since network generates continuous values, might exceed slightly.
+                    # But physically, E_mu cannot exceed E_prim.
+                    violations = (e_mu > e_prim).sum().item()
+                    total_violations_energy += violations
+                    
+                    # 2. Positive Energy: E_mu > 0 (or mass of muon)
+                    neg_violations = (e_mu < 0).sum().item()
+                    total_violations_neg += neg_violations
+                    
+                    total_muons += muons.shape[0]
+                
+                if total_muons > 0:
+                    rate_energy = total_violations_energy / total_muons
+                    rate_neg = total_violations_neg / total_muons
+                    
+                    pl_module.log("physics/energy_violation_rate", rate_energy)
+                    pl_module.log("physics/neg_energy_rate", rate_neg)
+                    
+            except Exception as e:
+                print(f"Physical check failed: {e}")
