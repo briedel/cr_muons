@@ -234,6 +234,7 @@ class convert_muonitron_parquet(icetray.I3ConditionalModule):
                     float(t.radius * math.sin(phi)),
                     float(t.radius * math.cos(phi)),
                 ])
+
             self.buf_muons.append(mu_rows)
 
         if len(self.buf_primary) >= self.buffer_size:
