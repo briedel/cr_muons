@@ -549,28 +549,38 @@ def fetch_pelican_token_via_helper(
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     try:
-        from utils.pelican.token_lib import get_access_token
+        from src.utils.pelican.token_lib import get_access_token
     except ImportError:
-        # Fallback: Load module directly from file path
-        # Path(__file__).resolve().parents[2] goes up from src/utils/pelican_utils.py to repo root
-        repo_root = Path(__file__).resolve().parents[2]
-        token_lib_path = repo_root / "utils" / "pelican" / "token_lib.py"
-        
-        if not token_lib_path.exists():
-            raise ImportError(
-                f"Auto-token requires the local token helper library at {token_lib_path}. "
-                "Make sure your environment includes the dependencies from requirements.txt."
-            )
-        
-        spec = importlib.util.spec_from_file_location("token_lib", token_lib_path)
-        token_lib = importlib.util.module_from_spec(spec)
         try:
-            spec.loader.exec_module(token_lib)
-            get_access_token = token_lib.get_access_token
-        except Exception as e:
-            raise ImportError(
-                f"Failed to load token_lib from {token_lib_path}: {e}"
-            ) from e
+            from utils.pelican.token_lib import get_access_token
+        except ImportError:
+            # Fallback: Load module directly from file path
+            # Path(__file__).resolve().parents[2] goes up from src/utils/pelican_utils.py to repo root
+            # Assume local utils/pelican structure or src/utils/pelican structure
+            repo_root = Path(__file__).resolve().parents[2]
+            
+            # Try repo_root/src/utils/pelican/token_lib.py
+            token_lib_path = repo_root / "src" / "utils" / "pelican" / "token_lib.py"
+            
+            if not token_lib_path.exists():
+                # Try repo_root/utils/pelican/token_lib.py
+                token_lib_path = repo_root / "utils" / "pelican" / "token_lib.py"
+            
+            if not token_lib_path.exists():
+                raise ImportError(
+                    f"Auto-token requires the local token helper library at {token_lib_path}. "
+                    "Make sure your environment includes the dependencies from requirements.txt."
+                )
+            
+            spec = importlib.util.spec_from_file_location("token_lib", token_lib_path)
+            token_lib = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(token_lib)
+                get_access_token = token_lib.get_access_token
+            except Exception as e:
+                raise ImportError(
+                    f"Failed to load token_lib from {token_lib_path}: {e}"
+                ) from e
 
     # federation_url and storage_prefix are kept for backward compatibility with the CLI,
     # but token acquisition only needs scope paths and the issuer URL.
