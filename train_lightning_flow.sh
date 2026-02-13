@@ -6,7 +6,7 @@
 set -o pipefail
 
 # --- Configuration ---
-MAX_RETRIES=0           # 0 = infinite retries
+MAX_RETRIES=1           # 0 = infinite retries
 INITIAL_BACKOFF=5       # seconds
 MAX_BACKOFF=300         # maximum backoff (5 minutes)
 BACKOFF_MULTIPLIER=2
@@ -58,15 +58,15 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         # stdbuf -oL -eL \ 
         python3 -u src/train.py \
         --model_type flow \
-        --data_dir "pelican://osg-htc.org/icecube/wipac/data/sim/IceCube/2025/testing/${RANGE_DIR}/*.parquet" \
+        --data_dir "pelican://osg-htc.org/icecube/wipac/data/sim/IceCube/2025/testing/23570/${RANGE_DIR}/*.parquet" \
         --file_format parquet \
-        --batch_size 4096 \
-        --num_workers 4 \
+        --batch_size 2048 \
+        --num_workers 6 \
         --pin_memory \
-        --multi_file_shuffle 4 \
+        --multi_file_shuffle 2 \
         # --shuffle_parquet \
-        --prefetch_batches 100 \
-        --prefetch_ahead 50 \
+        --prefetch_batches 1000 \
+        --prefetch_ahead 100 \
         --prefetch_concurrency 8 \
         --prefetch_dir "./testdata_flow/" \
         --delete_after_use \
@@ -74,7 +74,7 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         --max_epochs 1 \
         --auto_token \
         --resume_last \
-        --checkpoint_every_n_steps 10000 \
+        --checkpoint_every_n_steps 250 \
         --max_muons_per_event 250000 \
         --preflight_muon_threshold 300000 \
         --max_muons_per_batch 0 \
@@ -84,14 +84,23 @@ while [ "$CURRENT_RANGE" -le "$RANGE_END" ]; do
         --tb_hist_interval 100 \
         --lr 1e-4 \
         # why 16?
-        --flow_bins 16 \
+        --flow_bins 64 \
         #why 4?
-        --flow_transforms 4 \
+        --flow_transforms 8 \
+        --hidden_dim 512 \
         --mult_loss_weight 0.1 \
         --accelerator cuda \
         --devices 1 \
-        --drop_empty 
-
+        --drop_empty \
+        --muon_feature_selection r \
+        --feat_dim 2 \
+        # --base_dist "student-t" \
+        # --student_dof 5.0 \
+        # --compile \
+        --physics_check_interval 10000 \
+        --debug \
+        --precision 32 \
+        --accumulate_grad_batches 4 
     )
     
     attempt=0
