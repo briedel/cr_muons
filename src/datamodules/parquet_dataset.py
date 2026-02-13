@@ -184,6 +184,7 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         delete_after_use: bool = False,
         processed_files_shared=None,
         limit_files_per_epoch: int = 0,
+        muon_feature_selection: str = "all",
     ) -> None:
         super().__init__()
         self.file_paths = [str(p) for p in (file_paths or [])]
@@ -199,6 +200,7 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
         self.delete_after_use = delete_after_use
         self.processed_files_shared = processed_files_shared
         self.limit_files_per_epoch = limit_files_per_epoch
+        self.muon_feature_selection = muon_feature_selection
         
         # We can't pickle the whole prefetcher (it contains a thread),
         # but we can pickle the shared index and URI-to-index map.
@@ -473,6 +475,21 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
                 if flat_muons is None:
                     # Fallback: per-row conversion.
                     mu_list = [mu_col[i].as_py() for i in range(n_rb)]
+                    
+                    # Dynamically detect feature dimension from the first non-empty event
+                    # This allows supporting both 3-feature (E,x,y) and 4-feature (E,r,x,y) formats
+                    running_feat_dim = feat_dim
+                    for m in mu_list:
+                        if m and len(m) > 0:
+                            # m is a list of lists [[f1, f2...], [f1, f2...]]
+                            if len(m) > 0 and isinstance(m[0], (list, tuple)):
+                                running_feat_dim = len(m[0])
+                                break
+                    
+                    if running_feat_dim != feat_dim:
+                        # Update default if we found a different dimension
+                        feat_dim = running_feat_dim
+
                     mu_arrs = [
                         np.asarray(m, dtype=np.float32).reshape((-1, feat_dim)) if (m is not None and len(m) > 0) else np.zeros((0, feat_dim), dtype=np.float32)
                         for m in mu_list
@@ -481,6 +498,31 @@ class ParquetBatchIterableDataset(TorchIterableDataset):
                         flat_muons = torch.tensor(np.concatenate(mu_arrs, axis=0), dtype=torch.float32)
                     else:
                         flat_muons = torch.empty((0, feat_dim), dtype=torch.float32)
+
+                # Feature Selection / Slicing if requested (e.g. use r instead of x,y)
+                # Assumes source is [E, r, x, y] (4 features) or [E, x, y] (3 features)
+                if flat_muons.size(0) > 0 and self.muon_feature_selection != "all":
+                    # If we only have 3 features (E, x, y), we assume they are indices 0, 1, 2
+                    # If we have 4 features (E, r, x, y), indices are 0, 1, 2, 3
+                    
+                    if feat_dim == 4:
+                        if self.muon_feature_selection == "xy":
+                            # Use E, x, y -> indices 0, 2, 3
+                            flat_muons = flat_muons[:, [0, 2, 3]]
+                        elif self.muon_feature_selection == "r":
+                             # Use E, r -> indices 0, 1
+                             # NOTE: This reduces feat_dim to 2. Model must expect it.
+                             # Or maybe users wants E, r, z? Usually 3D is needed.
+                             # But user asked: "uses r OR x,y".
+                             # Assuming they mean using (Energy, Radius) vs (Energy, X, Y).
+                             flat_muons = flat_muons[:, [0, 1]]
+                    elif feat_dim == 3 and self.muon_feature_selection == "r":
+                        raise ValueError("Cannot select 'r' feature if only 3 features are present. Expected format with 'r' is [E, r, x, y].")
+                    elif feat_dim == 3 and self.muon_feature_selection == "xy":
+                        # Already x,y. Can't select "r" unless we compute it or it was there.
+                        # Assuming 3-col files are E, x, y.
+                        pass
+
 
                 # 2. Optional: Drop empty events
                 if self.drop_empty_events:
@@ -695,6 +737,7 @@ def get_parquet_batch_dataset(
     delete_after_use: bool = False,
     processed_files_shared=None,
     limit_files_per_epoch: int = 0,
+    muon_feature_selection: str = "all",
 ) -> ParquetBatchIterableDataset:
     return ParquetBatchIterableDataset(
         file_paths,
@@ -711,4 +754,5 @@ def get_parquet_batch_dataset(
         delete_after_use=delete_after_use,
         processed_files_shared=processed_files_shared,
         limit_files_per_epoch=limit_files_per_epoch,
+        muon_feature_selection=muon_feature_selection,
     )

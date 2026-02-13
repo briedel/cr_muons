@@ -3,7 +3,7 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 from .components.gan_components import ScalableGenerator, ScalableCritic, compute_gp_flat
-from .normalizer import DataNormalizer
+from .normalizer import GANNormalizer
 
 class MuonGAN(pl.LightningModule):
     def __init__(self, 
@@ -33,7 +33,7 @@ class MuonGAN(pl.LightningModule):
         self.automatic_optimization = False
         
         # Physics normalization
-        self.normalizer = DataNormalizer()
+        self.normalizer = GANNormalizer()
         
         # Histogram tracking
         self.last_real_feats = None

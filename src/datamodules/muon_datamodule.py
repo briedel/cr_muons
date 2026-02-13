@@ -32,6 +32,7 @@ class MuonDataModule(pl.LightningDataModule):
                  delete_after_use: bool = False,
                  limit_files_per_epoch: int = 0,
                  initial_processed_files: list = None,
+                 muon_feature_selection: str = "all",
                  token_refresh_args: dict = None
                  ):
         super().__init__()
@@ -181,6 +182,16 @@ class MuonDataModule(pl.LightningDataModule):
             # Wait for some files to be ready before starting training
             import time
             wait_count = min(self.hparams.multi_file_shuffle or 1, 10, len(self.files))
+            
+            # Avoid deadlock: The prefetcher only downloads 'ahead' files initially.
+            # We cannot wait for more files than that.
+            if self.hparams.prefetch_ahead > 0:
+                if self.hparams.prefetch_ahead < wait_count:
+                    print(f"Warning: prefetch_ahead ({self.hparams.prefetch_ahead}) is less than requested "
+                          f"shuffle/wait count ({wait_count}). Reducing wait goal to {self.hparams.prefetch_ahead} "
+                          "to avoid deadlock. Consider increasing --prefetch_ahead.")
+                    wait_count = self.hparams.prefetch_ahead
+
             print(f"Waiting for prefetcher to download first {wait_count} files (initially)...")
             start_t = time.time()
             max_wait = 600 # 10 minutes max wait
@@ -217,7 +228,8 @@ class MuonDataModule(pl.LightningDataModule):
                         original_uris=original_uris,
                         delete_after_use=self.hparams.delete_after_use,
                         processed_files_shared=self.processed_files,
-                        limit_files_per_epoch=self.hparams.limit_files_per_epoch
+                        limit_files_per_epoch=self.hparams.limit_files_per_epoch,
+                        muon_feature_selection=self.hparams.muon_feature_selection
                   )
              else:
                  self.train_dataset = get_hf_dataset(

@@ -247,3 +247,23 @@ class PhysicalCorrectnessCallback(pl.Callback):
                     
             except Exception as e:
                 print(f"Physical check failed: {e}")
+
+class LearningRateLogger(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.last_lr = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if not trainer.optimizers:
+            return
+            
+        # Access the first optimizer's first param group
+        params = trainer.optimizers[0].param_groups[0]
+        lr = params.get('lr')
+        
+        if lr is not None:
+            if self.last_lr is not None and lr != self.last_lr:
+                print(f"\n[LR Monitor] Learning rate changed from {self.last_lr:.2e} to {lr:.2e}")
+            elif self.last_lr is None:
+                print(f"\n[LR Monitor] Tracking learning rate. Initial: {lr:.2e}")
+            self.last_lr = lr
