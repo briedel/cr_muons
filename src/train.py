@@ -5,7 +5,7 @@ from src.datamodules.muon_datamodule import MuonDataModule
 from src.models.gan_module import MuonGAN
 from src.models.flow_module import MuonFlow
 from src.callbacks.adaptive_tuning import AdaptiveCriticTuning
-from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback, PhysicalCorrectnessCallback
+from src.callbacks.monitoring import PerformanceMonitoringCallback, HistogramLoggingCallback, PhysicalCorrectnessCallback, LearningRateLogger
 from src.utils import (
     expand_pelican_wildcards,
     fetch_pelican_token_via_helper,
@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--prefetch_dir", type=str, default=None, help="Cache directory for Pelican prefetching")
     parser.add_argument("--delete_after_use", action="store_true", help="Delete local files after they have been processed")
     parser.add_argument("--limit_files_per_epoch", type=int, default=0, help="If > 0, stop each epoch after this many files")
+    parser.add_argument("--muon_feature_selection", type=str, default="all", choices=["all", "xy", "r"], help="Select muon features: 'all', 'xy' (E,x,y), or 'r' (E,r)")
 
     # Pelican / Authtokens
     parser.add_argument("--auto_token", action="store_true", help="Automatically fetch via osg-token-scope")
@@ -64,6 +65,8 @@ def main():
     parser.add_argument("--flow_bins", type=int, default=10)
     parser.add_argument("--flow_transforms", type=int, default=3)
     parser.add_argument("--mult_loss_weight", type=float, default=0.1)
+    parser.add_argument("--base_dist", type=str, default="normal", choices=["normal", "student-t"], help="Base distribution for flow")
+    parser.add_argument("--student_dof", type=float, default=4.0, help="Degrees of freedom for Student-T base distribution")
 
     # GAN specific params
     parser.add_argument("--latent_dim_global", type=int, default=32)
@@ -86,7 +89,7 @@ def main():
     parser.add_argument("--tb_log_interval", type=int, default=10)
     parser.add_argument("--tb_hist_interval", type=int, default=1000)
     parser.add_argument("--tb_max_muons", type=int, default=20000)
-    parser.add_argument("--physics_check_interval", type=int, default=100, help="Check physical correctness every N steps")
+    parser.add_argument("--physics_check_interval", type=int, default=1000, help="Check physical correctness every N steps")
     
     # Checkpointing / Resume
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to a checkpoint file (.ckpt) to resume from")
@@ -94,6 +97,14 @@ def main():
     parser.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Save checkpoint every N training steps")
     parser.add_argument("--model_checkpoint", type=str, default=None)
     parser.add_argument("--debug", action="store_true", help="Enable debug prints for normalization")
+
+    # Optimization
+    parser.add_argument("--precision", type=str, default="32", 
+                        help="Trainer precision. Common options: '32', '16-mixed' (FP16 mixed), 'bf16-mixed' (BF16 mixed), "
+                             "'16-true', 'bf16-true', '64-true'. See PL docs for full list.")
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1, help="Accumulate gradients over k batches before stepping optimizer")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile for graph optimization")
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="Mode for torch.compile")
 
     args = parser.parse_args()
 
@@ -206,6 +217,7 @@ def main():
         delete_after_use=args.delete_after_use,
         limit_files_per_epoch=args.limit_files_per_epoch,
         initial_processed_files=initial_processed_files,
+        muon_feature_selection=args.muon_feature_selection,
         token_refresh_args=token_refresh_args
     )
 
@@ -248,14 +260,43 @@ def main():
             mult_loss_weight=args.mult_loss_weight,
             lr=args.lr,
             chunk_size=args.max_muons_per_batch,
-            debug=args.debug
+            debug=args.debug,
+            base_dist=args.base_dist,
+            student_dof=args.student_dof
         )
         callbacks = [
             ModelCheckpoint(filename="{epoch}-{step}-{train_loss:.2f}", monitor="train_loss", mode="min", save_last=True, every_n_train_steps=args.checkpoint_every_n_steps),
             LearningRateMonitor(logging_interval="step"),
             PerformanceMonitoringCallback(log_interval=args.tb_log_interval),
-            PhysicalCorrectnessCallback(log_every_n_steps=args.physics_check_interval)
+            PhysicalCorrectnessCallback(log_every_n_steps=args.physics_check_interval),
+            LearningRateLogger()
         ]
+
+    # Optional: Torch Compile
+    if args.compile:
+        if not hasattr(torch, "compile"):
+             print("Warning: --compile requested but torch.compile is not available (requires PyTorch 2.0+). Ignoring.")
+        else:
+             print(f"Compiling model submodules with mode='{args.compile_mode}'...")
+             # Instead of compiling the LightningModule (which can be problematic with Trainer checks),
+             # we compile the underlying neural networks.
+             if args.model_type == "flow":
+                 # Compile the flow and multiplicity nets
+                 if hasattr(model, "flow"):
+                     model.flow = torch.compile(model.flow, mode=args.compile_mode)
+                 if hasattr(model, "multiplicity_net"):
+                     model.multiplicity_net = torch.compile(model.multiplicity_net, mode=args.compile_mode)
+             elif args.model_type == "gan":
+                 # Compile generator and critic
+                 if hasattr(model, "generator"):
+                     model.generator = torch.compile(model.generator, mode=args.compile_mode)
+                 if hasattr(model, "critic"):
+                     model.critic = torch.compile(model.critic, mode=args.compile_mode)
+
+    # Precision Checks
+    if "bf16" in args.precision and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        print(f"Warning: Precision '{args.precision}' requested, but BF16 is not supported by this GPU. "
+              "Training may fail or fallback to FP32 depending on PyTorch Lightning settings.")
 
     # Trainer
     run_name = args.tb_run_name or time.strftime("%Y%m%d-%H%M%S")
@@ -268,8 +309,10 @@ def main():
         accelerator=args.accelerator,
         devices=args.devices,
         max_epochs=args.max_epochs,
+        precision=args.precision,
         callbacks=callbacks,
-        logger=logger
+        logger=logger,
+        accumulate_grad_batches=args.accumulate_grad_batches
     )
 
     trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
